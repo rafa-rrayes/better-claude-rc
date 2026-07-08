@@ -1,0 +1,19 @@
+# Runtime data: auth token + private session transcripts.
+# Recreated automatically on first run (server/config.py Config.load()).
+data/
+
+# Personal working notes (plan, todo, lessons) — local only
+tasks/
+
+# Python virtualenv (280 MB; recreate with `uv sync`)
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Tooling caches
+.ruff_cache/
+
+# macOS
+.DS_Store
