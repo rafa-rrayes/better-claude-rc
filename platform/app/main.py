@@ -35,6 +35,11 @@ from .stripe_webhooks import router as stripe_router
 
 log = logging.getLogger("bcrc.platform")
 
+# uvicorn configures only its own loggers; without a root handler, INFO
+# records from bcrc.* (including the dev-mode magic-link emails) are
+# silently dropped. No-op if the embedding process configured logging.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(message)s")
+
 # The platform serves the identical PWA from the installed agent package —
 # one frontend copy, no drift (plan §repo layout).
 WEB_DIR = Path(str(files("server").joinpath("web")))
