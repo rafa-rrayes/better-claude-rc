@@ -37,6 +37,10 @@ PTYPE_JSON = 0x01  # JSON control/event messages
 # replay is chunked). The relay enforces the cap and kills violators.
 FRAME_MAX_PLAINTEXT = 256 * 1024
 
+# On-the-wire cap enforced by the relay and both endpoints: header + plaintext
+# cap + generous allowance for codec overhead (secretstream adds 17B/frame).
+FRAME_MAX_WIRE = HEADER_LEN + FRAME_MAX_PLAINTEXT + 512
+
 # Agent-side per-channel outbound queue policy (plan §backpressure):
 # transient (seq:null) events drop oldest-first past TRANSIENT_QUEUE_MAX;
 # seq events are never dropped — past CHANNEL_QUEUE_MAX the channel closes

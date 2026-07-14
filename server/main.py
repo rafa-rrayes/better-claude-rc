@@ -27,8 +27,9 @@ from fastapi.staticfiles import StaticFiles
 from . import VERSION, rpc
 from .config import Config
 from .rpc import RpcError
-from .sessions import BUSY_STATES, SessionManager
-from .terminal import TerminalError, TerminalManager, claude_argv
+from .sessions import SessionManager
+from .term_attach import attach_terminal
+from .terminal import TerminalManager
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
@@ -361,86 +362,50 @@ async def _safe(coro, runner) -> None:
 
 # ---------------- true view (real claude TUI over a PTY) ----------------
 
-@app.websocket("/ws/term/{sid}")
-async def ws_terminal(ws: WebSocket, sid: str):
-    """Attach an xterm.js client to the session's PTY terminal, spawning
-    `claude --resume <claude_id>` on first attach. Server→client: binary
-    frames are raw terminal output; text frames are JSON control messages
-    ({"type": "exit"|"pong"}). Client→server: JSON text frames
-    ({"type": "input"|"resize"|"ping"|"kill"})."""
-    if not await _ws_auth(ws):
-        return
+class _LocalTermTransport:
+    """TermTransport over the local WebSocket: binary frames are raw
+    terminal output, text frames are JSON control messages."""
 
-    async def bail(reason: str) -> None:
-        await ws.send_json({"type": "exit", "reason": reason})
-        await ws.close()
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
 
-    runner = mgr().get(sid)
-    if runner is None:
-        await bail("No such session")
-        return
-    if not runner.claude_ids:
-        await bail("No Claude session yet — send a message first")
-        return
-    if runner.client is not None and runner.state in BUSY_STATES:
-        await bail("Session is busy in the app — wait for the turn to finish")
-        return
-    if runner.client is not None:
-        await runner.detach_for_terminal()
-    term = terms.get(sid)
-    if term is None:
-        try:
-            argv = claude_argv(runner.claude_ids[-1], runner.model, runner.mode)
-            term = terms.open(sid, argv, runner.cwd)
-        except (TerminalError, OSError) as e:
-            await bail(f"Could not start terminal: {e}")
-            return
+    async def send_bytes(self, data: bytes) -> None:
+        await self.ws.send_bytes(data)
 
-    q: asyncio.Queue = asyncio.Queue()
-    replay = term.attach(q)
+    async def send_json(self, obj: dict) -> None:
+        await self.ws.send_json(obj)
 
-    async def pump() -> None:
-        if replay:
-            await ws.send_bytes(replay)
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.ws.close()
+
+    async def recv_json(self) -> dict | None:
         while True:
-            item = await q.get()
-            if isinstance(item, dict):
-                await ws.send_json(item)
-                if item.get("type") == "exit":
-                    await ws.close()
-                    return
-            else:
-                await ws.send_bytes(item)
-
-    sender = asyncio.create_task(pump())
-    try:
-        while True:
-            msg = await ws.receive()
+            try:
+                msg = await self.ws.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                return None
             if msg["type"] == "websocket.disconnect":
-                break
+                return None
             text = msg.get("text")
             if not text:
                 continue
             try:
-                data = json.loads(text)
+                return json.loads(text)
             except json.JSONDecodeError:
                 continue
-            dtype = data.get("type")
-            if dtype == "input":
-                term.write(str(data.get("data", "")).encode())
-            elif dtype == "resize":
-                term.resize(int(data.get("cols") or 0), int(data.get("rows") or 0))
-            elif dtype == "ping":
-                q.put_nowait({"type": "pong"})
-            elif dtype == "kill":
-                terms.close(sid, "Terminal ended")
-    except WebSocketDisconnect:
-        pass
-    finally:
-        term.detach(q)
-        sender.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await sender
+
+
+@app.websocket("/ws/term/{sid}")
+async def ws_terminal(ws: WebSocket, sid: str):
+    """Attach an xterm.js client to the session's PTY terminal. The body
+    lives in term_attach.attach_terminal, shared with relay term channels.
+    Server→client: binary frames are raw terminal output; text frames are
+    JSON control messages ({"type": "exit"|"pong"}). Client→server: JSON
+    text frames ({"type": "input"|"resize"|"ping"|"kill"})."""
+    if not await _ws_auth(ws):
+        return
+    await attach_terminal(mgr(), terms, sid, _LocalTermTransport(ws))
 
 
 # ---------------- static frontend ----------------

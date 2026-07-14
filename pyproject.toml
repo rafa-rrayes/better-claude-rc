@@ -11,6 +11,7 @@ dependencies = [
     "fastapi>=0.139.0",
     "qrcode>=8.2",
     "uvicorn[standard]>=0.50.2",
+    "websockets>=16.0",
 ]
 
 [project.scripts]
@@ -30,3 +31,11 @@ include = ["server", "scripts", "README.md", "LICENSE"]
 
 [tool.uv.workspace]
 members = ["platform"]
+
+[tool.uv.sources]
+bcrc-platform = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "bcrc-platform",
+]

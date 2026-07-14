@@ -102,24 +102,32 @@ class MuxConn:
             self._pump_task = asyncio.get_running_loop().create_task(self._pump())
 
     async def _pump(self) -> None:
-        while not self.closed:
-            sent = False
-            for ch in list(self._channels.values()):
-                if ch.closed or not ch.items:
-                    continue
-                is_transient, plaintext = ch.items.popleft()
-                if is_transient:
-                    ch.transients -= 1
-                header = proto.pack_header(proto.KIND_DATA, ch.id)
-                payload = self.codec.seal(header, plaintext)
-                await self._send_bytes(header + payload)
-                sent = True
-            if not sent:
-                self._wake.clear()
-                if any(ch.items and not ch.closed
-                       for ch in self._channels.values()):
-                    continue  # raced with a put
-                await self._wake.wait()
+        try:
+            while not self.closed:
+                sent = False
+                for ch in list(self._channels.values()):
+                    if ch.closed or not ch.items:
+                        continue
+                    is_transient, plaintext = ch.items.popleft()
+                    if is_transient:
+                        ch.transients -= 1
+                    header = proto.pack_header(proto.KIND_DATA, ch.id)
+                    payload = self.codec.seal(header, plaintext)
+                    await self._send_bytes(header + payload)
+                    sent = True
+                if not sent:
+                    self._wake.clear()
+                    if any(ch.items and not ch.closed
+                           for ch in self._channels.values()):
+                        continue  # raced with a put
+                    await self._wake.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Transport failure (e.g. uplink died mid-send): the conn is
+            # unusable — mark closed so senders get ChannelClosed and
+            # close() doesn't re-raise. The owner's recv side tears down.
+            self.closed = True
 
     def pending(self, ch_id: int) -> int:
         ch = self._channels.get(ch_id)

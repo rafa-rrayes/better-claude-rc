@@ -63,12 +63,84 @@ def _serve(args: argparse.Namespace) -> None:
 
 
 def _connect(args: argparse.Namespace) -> None:
-    # Implemented in M2 (relay + connect mode). The subcommand exists now so
-    # the enrollment one-liner is stable: `uvx better-claude-rc connect <tok>`.
-    print("connect mode is not available yet — coming in a future release.")
+    """Run the local server (127.0.0.1 unless --lan) + the relay uplink."""
+    import asyncio
+    import os
+    import uuid
+
+    from . import main as main_mod
+
+    cfg = main_mod.config
+    host = "0.0.0.0" if args.lan else "127.0.0.1"
+    port = args.port or cfg.port
+    relay = (args.relay or os.environ.get("BCRC_RELAY_URL")
+             or cfg.extra.get("relay_url"))
+    if not relay:
+        print("No relay URL. Pass --relay wss://… or set BCRC_RELAY_URL.")
+        sys.exit(2)
+    machine_id = os.environ.get("BCRC_MACHINE_ID") or cfg.extra.get("machine_id")
+    if not machine_id:
+        machine_id = uuid.uuid4().hex
+        cfg.extra["machine_id"] = machine_id
+        cfg.save()
     if args.enroll_token:
-        print(f"(enroll token received: {args.enroll_token[:12]}…)")
-    sys.exit(2)
+        # Enrollment (Ed25519 identity + machine registry) lands in M3; the
+        # token is accepted now so the one-liner is stable.
+        print("(enrollment not yet available — connecting with a stub identity)")
+
+    print()
+    print("  Better Claude RC — connect mode")
+    print(f"  Local app     http://{'localhost' if host == '127.0.0.1' else host}:{port}")
+    print(f"  Relay         {relay}")
+    print(f"  Machine id    {machine_id}")
+    print()
+
+    try:
+        asyncio.run(_connect_run(main_mod, host, port, relay, machine_id))
+    except KeyboardInterrupt:
+        pass
+
+
+async def _connect_run(main_mod, host: str, port: int,
+                       relay: str, machine_id: str) -> None:
+    import asyncio
+    import contextlib
+    import os
+
+    import uvicorn
+
+    from .connect import Uplink
+
+    server = uvicorn.Server(uvicorn.Config(
+        main_mod.app, host=host, port=port, log_level="warning"))
+    server_task = asyncio.create_task(server.serve())
+    while not server.started:
+        if server_task.done():
+            server_task.result()  # surface bind errors
+            return
+        await asyncio.sleep(0.05)
+    while main_mod.manager is None:
+        await asyncio.sleep(0.05)
+
+    uplink = Uplink(
+        main_mod.mgr(), main_mod.terms, main_mod.config, relay, machine_id,
+        ping_interval=float(os.environ.get("BCRC_PING_INTERVAL", 20)),
+        ping_timeout=float(os.environ.get("BCRC_PING_TIMEOUT", 25)),
+    )
+    uplink_task = asyncio.create_task(uplink.run())
+    try:
+        done, _ = await asyncio.wait({server_task, uplink_task},
+                                     return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (uplink_task, server_task):
+            if not task.done():
+                if task is server_task:
+                    server.should_exit = True
+                else:
+                    task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await uplink_task
+        await server_task
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -91,6 +163,13 @@ def main(argv: list[str] | None = None) -> None:
 
     p_connect = sub.add_parser("connect", help="connect to the hosted platform")
     p_connect.add_argument("enroll_token", nargs="?", default=None)
+    p_connect.add_argument("--relay", default=None,
+                           help="relay URL (or BCRC_RELAY_URL)")
+    p_connect.add_argument("--port", type=int, default=None,
+                           help="local server port")
+    p_connect.add_argument("--lan", action="store_true",
+                           help="bind the local server to 0.0.0.0 "
+                                "(default: 127.0.0.1)")
     p_connect.set_defaults(func=_connect)
 
     args = parser.parse_args(argv)
