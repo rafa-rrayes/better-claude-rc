@@ -29,7 +29,9 @@ from . import metrics, relay
 from .db import Db
 from .limits import limiter
 from .routes_auth import router as auth_router
+from .routes_billing import router as billing_router
 from .routes_machines import router as machines_router
+from .stripe_webhooks import router as stripe_router
 
 log = logging.getLogger("bcrc.platform")
 
@@ -88,6 +90,8 @@ async def security_headers(request: Request, call_next):
 
 app.include_router(auth_router)
 app.include_router(machines_router)
+app.include_router(billing_router)
+app.include_router(stripe_router)
 app.include_router(relay.router)
 
 

@@ -11,6 +11,11 @@ reconnect runs a fresh handshake before sealed traffic resumes.
      machine_status{online:false} flows to the client. SIGCONT → agent
      reconnects → machine_status{online:true}; channels reopen (fresh
      handshake again) and attach{since_seq} still replays clean.
+  3. Duplicate agent connect: a second agent process (same identity/devices
+     dir) dials in → the relay kicks the old uplink (4409), channels close
+     with agent_replaced, the client reopens against the NEW agent and a
+     full attach{since_seq:0} replay is gap-free — nothing lost, recovery
+     unaided.
 
 The agent runs `server.cli connect` as a real subprocess (so it can be
 SIGSTOPped); the relay runs in-process with 1s/2s WS keepalive so reaping is
@@ -34,7 +39,7 @@ import uvicorn  # noqa: E402
 from app.main import app as platform_app  # noqa: E402
 from relay_client import DeviceSim, FakeClient  # noqa: E402
 
-HOST, RPORT, APORT = "127.0.0.1", 8809, 8810
+HOST, RPORT, APORT, APORT2 = "127.0.0.1", 8809, 8810, 8812
 RELAY = f"ws://{HOST}:{RPORT}"
 MACHINE = "reconn-mach"
 CWD = str(ROOT / "data" / "e2e-playground")
@@ -64,16 +69,17 @@ async def stop_relay(server, task):
         await task
 
 
-def start_agent(data_dir: str) -> subprocess.Popen:
+def start_agent(data_dir: str, port: int = APORT,
+                log_name: str = "agent.log") -> subprocess.Popen:
     env = {**os.environ,
            "BCRC_DATA_DIR": data_dir,
            "BCRC_MACHINE_ID": MACHINE,
            "BCRC_PING_INTERVAL": "1",
            "BCRC_PING_TIMEOUT": "2"}
-    logf = open(Path(data_dir) / "agent.log", "wb")
+    logf = open(Path(data_dir) / log_name, "wb")
     return subprocess.Popen(
         [sys.executable, "-u", "-m", "server.cli", "connect", "--no-qr",
-         "--relay", RELAY, "--port", str(APORT)],
+         "--relay", RELAY, "--port", str(port)],
         cwd=str(ROOT), env=env,
         stdout=logf, stderr=subprocess.STDOUT)
 
@@ -120,6 +126,7 @@ async def main():
     data_dir = tempfile.mkdtemp(prefix="bcrc-reconn-")
     relay_server, relay_task = await start_relay()
     agent = start_agent(data_dir)
+    agent2 = None
     collected: dict[int, str] = {}  # seq -> kind
     saw_result = False
 
@@ -215,18 +222,49 @@ async def main():
         assert all(s > max(collected) for s in extra), extra
         print("re-attach after freeze ok — no replay gaps")
 
-        r = await c2.rpc(ctrl3, "sessions.delete", {"sid": sid})
+        # ---- phase 3: duplicate agent connect → old kicked (4409), new
+        # agent serves (same identity + paired devices dir, fresh process,
+        # different local port) — no lost seq events, recovery unaided.
+        agent2 = start_agent(data_dir, port=APORT2, log_name="agent2.log")
+        while True:  # drain stale agent_gone closes from the SIGSTOP phase
+            closed = await c2.next_ctrl("close", timeout=60)
+            if closed.get("reason") == "agent_replaced":
+                break
+        print("PHASE 3a PASS — duplicate connect kicked the old uplink "
+              "(channels closed agent_replaced)")
+        await c2.wait_status(True, timeout=60)
+        ctrl4 = await open_ctrl(c2)  # fresh handshake with the NEW agent
+        await c2.send_json(ctrl4, {"type": "attach", "session_id": sid,
+                                   "since_seq": 0})
+        att4 = await c2.wait_type(ctrl4, "attached")
+        evs4 = [e for e in (att4.get("events") or [])
+                if e.get("seq") is not None]
+        seqs4 = [e["seq"] for e in evs4]
+        assert seqs4 and seqs4[0] == 1 and \
+            seqs4 == list(range(1, len(seqs4) + 1)), \
+            f"full replay must be gap-free from seq 1: {seqs4[:10]}"
+        assert set(collected) <= set(seqs4), \
+            "seq events lost across the duplicate-agent kick"
+        assert any(e.get("kind") == "result" for e in evs4), \
+            "result missing from the new agent's replay"
+        print(f"PHASE 3b PASS — new agent replayed 1..{seqs4[-1]} gap-free "
+              "(duplicate-agent chaos recovered unaided)")
+
+        r = await c2.rpc(ctrl4, "sessions.delete", {"sid": sid})
         assert r["ok"], r
         await c2.close()
         await c.close()
         print("\nRELAY RECONNECT E2E PASS")
     finally:
-        agent.send_signal(signal.SIGCONT)  # in case we failed while stopped
-        agent.terminate()
-        try:
-            agent.wait(10)
-        except subprocess.TimeoutExpired:
-            agent.kill()
+        for proc in (agent, agent2):
+            if proc is None:
+                continue
+            proc.send_signal(signal.SIGCONT)  # in case one is stopped
+            proc.terminate()
+            try:
+                proc.wait(10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         await stop_relay(relay_server, relay_task)
 
 

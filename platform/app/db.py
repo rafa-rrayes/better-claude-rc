@@ -217,6 +217,14 @@ class Db:
             " proto = coalesce($3, proto), last_seen_at = now() WHERE id = $1",
             machine_id, agent_version, proto)
 
+    # ---------------- billing ----------------
+
+    async def subscription_for(self, user_id: uuid.UUID) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            "SELECT user_id, stripe_customer_id, stripe_subscription_id,"
+            " status, price_id, current_period_end"
+            " FROM subscriptions WHERE user_id = $1", user_id)
+
     # ---------------- audit (append-only, metadata only) ----------------
 
     async def audit(self, event: str, *, user_id: uuid.UUID | None = None,

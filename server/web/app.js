@@ -459,6 +459,12 @@ function openDrawer() {
             renderDevicesScreen();
           } }, "devices")
         : null,
+      S.mode === "platform"
+        ? el("button", { class: "foot-btn", onclick: () => {
+            closeDrawer();
+            renderBillingScreen();
+          } }, "billing")
+        : null,
       el("button", { class: "foot-btn", onclick: doLogout }, "log out"))));
   $("#drawer-root").append(backdrop);
   loadLibrary().then(() => {
@@ -619,8 +625,66 @@ function renderMachinePicker() {
   }
   box.append(el("div", { class: "a-buttons", style: "margin-top:18px" },
     el("button", { class: "btn small", onclick: refreshMachines }, "Refresh"),
+    el("button", { class: "btn small", onclick: renderBillingScreen }, "Billing"),
     el("button", { class: "btn small", onclick: doLogout }, "Log out")));
   view.replaceChildren(box);
+}
+
+// -------- platform billing (two buttons — Stripe owns the rest) --------
+
+async function renderBillingScreen() {
+  setTopbar();
+  const view = $("#view");
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Billing"),
+    el("div", { class: "empty" }, "Loading…")));
+  let b;
+  try {
+    b = await api("/api/billing");
+  } catch (e) {
+    view.replaceChildren(el("div", { class: "pad" },
+      el("div", { class: "empty" }, "Could not load billing: " + (e.message || e))));
+    return;
+  }
+  S.plan = b.plan;
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Billing"),
+    el("div", { class: "card" },
+      kvRow("Plan", b.plan === "pro" ? "Pro" : "Free"),
+      b.status ? kvRow("Subscription", b.status) : null,
+      b.current_period_end
+        ? kvRow("Renews", new Date(b.current_period_end).toLocaleDateString())
+        : null),
+    el("div", { class: "notice", style: "margin-top:12px" },
+      b.plan === "pro"
+        ? "Card, invoices and cancellation are managed by Stripe."
+        : "Pro: more machines, more concurrent connections and terminals."),
+    el("div", { class: "a-buttons", style: "margin-top:18px" },
+      b.plan === "pro" ? null
+        : el("button", { class: "btn primary", onclick: startCheckout },
+            "Upgrade to Pro"),
+      el("button", { class: "btn", onclick: openBillingPortal }, "Manage billing"),
+      el("button", { class: "btn small", onclick: () => {
+        if (T && S._stateLoaded) render(); else renderMachinePicker();
+      } }, "Back"))));
+}
+
+async function startCheckout() {
+  try {
+    const r = await api("/api/billing/checkout", { method: "POST" });
+    if (r.url) location.href = r.url;
+  } catch (e) {
+    toast(e.message || "Could not start checkout", true);
+  }
+}
+
+async function openBillingPortal() {
+  try {
+    const r = await api("/api/billing/portal", { method: "POST" });
+    if (r.url) location.href = r.url;
+  } catch (e) {
+    toast(e.message || "Could not open the billing portal", true);
+  }
 }
 
 async function refreshMachines() {
@@ -2180,6 +2244,14 @@ async function boot() {
 }
 
 async function bootPlatform() {
+  // Stripe redirects land on #billing=success|cancelled — toast + strip
+  const mBill = (location.hash || "").match(/^#billing=([a-z_]+)$/);
+  if (mBill) {
+    history.replaceState(null, "", location.pathname);
+    if (mBill[1] === "success") toast("Payment complete — you're on Pro");
+    else if (mBill[1] === "cancelled") toast("Checkout cancelled");
+  }
+
   // magic-link token arrives in the URL fragment — never a query string
   const mAuth = (location.hash || "").match(/^#auth=([A-Za-z0-9_-]+)$/);
   if (mAuth) {

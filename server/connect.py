@@ -51,6 +51,12 @@ BACKOFF_BASE = 1.0
 BACKOFF_CAP = 60.0
 KICK_MIN_BACKOFF = 30.0  # after a 4409 duplicate-agent kick
 
+# Live Claude sessions per plan (plan §data model: free tier runs 1). The
+# plan rides CTRL welcome{plan}; agent-enforced, soft by design — applied at
+# create time only, nothing is killed on downgrade (the machine cap is the
+# real lever). Local serve mode has no Uplink, so it is never capped.
+SESSION_CAPS = {"free": 1, "pro": 10}
+
 _FATAL_UNAUTHORIZED = (proto.CLOSE_UNAUTHORIZED, proto.CLOSE_FORBIDDEN)
 
 
@@ -334,6 +340,10 @@ class Uplink:
                 msg = json.loads(body)
             except ValueError:
                 return
+            refusal = self._quota_refusal(msg)
+            if refusal is not None:
+                chan.push(refusal)
+                return
             try:
                 await main_mod.handle_ws(self.manager, chan, msg)
             except Exception as e:
@@ -354,6 +364,25 @@ class Uplink:
                         self._run_term(client, chan, data["sid"]))
             else:
                 chan.inbox.put_nowait(data)
+
+    def _quota_refusal(self, msg: dict) -> dict | None:
+        """Plan enforcement (SESSION_CAPS): refuse sessions.create when the
+        plan's live-session cap is already met. Returns the rpc_result to
+        push, or None to let the request through."""
+        if msg.get("type") != "rpc" or msg.get("method") != "sessions.create":
+            return None
+        cap = SESSION_CAPS.get(self.plan or "")
+        if cap is None:
+            return None
+        live = sum(1 for r in self.manager.runners.values()
+                   if r.client is not None)
+        if live < cap:
+            return None
+        return {"type": "rpc_result", "id": msg.get("id"), "ok": False,
+                "error": {"code": "quota_sessions",
+                          "message": f"your plan runs {cap} live session"
+                                     f"{'s' if cap != 1 else ''} — stop one "
+                                     "or upgrade"}}
 
     # -------- E2E handshake (KIND_HS on the client's ctrl channel) --------
 
