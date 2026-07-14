@@ -137,7 +137,6 @@ const S = {
   status: {},          // sid -> {state, detail}
   context: {},         // sid -> context usage
   subs: new Set(),
-  ws: null,
   wsUp: false,
   defaults: { models: ["default", "opus", "sonnet", "haiku"], modes: ["default", "acceptEdits", "plan"] },
   home: "",
@@ -151,7 +150,7 @@ let _libPromise = null;
 function loadLibrary() {
   if (S.library && Date.now() - S.libraryAt < 15000) return Promise.resolve(S.library);
   if (!_libPromise) {
-    _libPromise = api("/api/library")
+    _libPromise = T.rpc("library")
       .then((lib) => { S.library = lib; S.libraryAt = Date.now(); return lib; })
       .finally(() => { _libPromise = null; });
   }
@@ -162,7 +161,7 @@ let _projPromise = null;
 function loadProjects() {
   if (S.projects && Date.now() - S.projectsAt < 30000) return Promise.resolve(S.projects);
   if (!_projPromise) {
-    _projPromise = api("/api/projects")
+    _projPromise = T.rpc("projects.recent")
       .then(({ projects }) => { S.projects = projects; S.projectsAt = Date.now(); return projects; })
       .finally(() => { _projPromise = null; });
   }
@@ -201,16 +200,13 @@ function closeTab(sid) {
 loadTabs();
 
 // ---------------------------------------------------------------- api
-
-function authHeaders() {
-  const t = localStorage.getItem("bcrc_token");
-  return t ? { Authorization: "Bearer " + t } : {};
-}
+// REST is only used for auth (/api/login, /api/logout) and /api/env.
+// Everything else rides the transport as rpc over the control channel.
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     ...opts,
-    headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
   });
   if (res.status === 401) { S.authed = false; nav({ name: "login" }); throw new Error("unauthorized"); }
   if (!res.ok) {
@@ -221,47 +217,29 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-// ---------------------------------------------------------------- websocket
+// ---------------------------------------------------------------- transport
 
-let wsRetry = 0;
-
-function wsConnect() {
-  if (S.ws && (S.ws.readyState === 0 || S.ws.readyState === 1)) return;
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const t = localStorage.getItem("bcrc_token");
-  const url = `${proto}://${location.host}/ws` + (t ? `?token=${encodeURIComponent(t)}` : "");
-  const ws = new WebSocket(url);
-  S.ws = ws;
-
-  ws.onopen = () => {
-    S.wsUp = true; wsRetry = 0;
-    updateConnUI();
-    for (const sid of S.subs) {
-      ws.send(JSON.stringify({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 }));
-    }
-  };
-  ws.onmessage = (e) => {
-    let msg; try { msg = JSON.parse(e.data); } catch { return; }
-    handleWS(msg);
-  };
-  ws.onclose = (e) => {
-    S.wsUp = false; updateConnUI();
-    if (e.code === 4401) { S.authed = false; nav({ name: "login" }); return; }
-    setTimeout(wsConnect, Math.min(8000, 500 * 2 ** wsRetry++));
-  };
-  ws.onerror = () => ws.close();
-}
+let T = null; // set during boot (LocalTransport for now; see transport.js)
 
 function wsSend(obj) {
-  if (S.ws && S.ws.readyState === 1) { S.ws.send(JSON.stringify(obj)); return true; }
+  if (T && T.send(obj)) return true;
   toast("Not connected — retrying…", true);
-  wsConnect();
   return false;
 }
 
-setInterval(() => { if (S.ws && S.ws.readyState === 1) S.ws.send('{"type":"ping"}'); }, 25000);
+function onTransportStatus(st) {
+  S.wsUp = !!st.up;
+  updateConnUI();
+  if (st.authRequired) { S.authed = false; nav({ name: "login" }); return; }
+  if (st.up) {
+    for (const sid of S.subs) {
+      T.send({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
+    }
+  }
+}
+
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && S.authed) wsConnect();
+  if (!document.hidden && S.authed && T) T.connect();
 });
 
 function handleWS(msg) {
@@ -335,11 +313,9 @@ function applyEventToState(sid, ev) {
 function subscribe(sid) {
   if (S.subs.has(sid)) return;
   S.subs.add(sid);
-  if (S.ws && S.ws.readyState === 1) {
-    wsSend({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
-  } else {
-    wsConnect();
-  }
+  // if the socket is down, T.send reconnects and onTransportStatus
+  // re-attaches every S.subs entry once it is up again
+  if (T) T.send({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
 }
 
 // ---------------------------------------------------------------- router
@@ -474,10 +450,10 @@ function closeDrawer() { $("#drawer-root").replaceChildren(); }
 
 async function doLogout() {
   try { await api("/api/logout", { method: "POST" }); } catch {}
-  localStorage.removeItem("bcrc_token");
+  localStorage.removeItem("bcrc_token"); // legacy cleanup
   S.authed = false;
   closeDrawer(); closeSheet();
-  try { S.ws?.close(); } catch {}
+  try { T?.close(); } catch {}
   renderLogin();
 }
 
@@ -554,7 +530,6 @@ async function doLogin() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token }),
     }).then((r) => { if (!r.ok) throw new Error("Wrong token"); });
-    localStorage.setItem("bcrc_token", token);
     await boot();
   } catch (e) {
     $("#login-err").textContent = e.message || "Login failed";
@@ -717,10 +692,10 @@ function sessionMenu(s) {
   sheet(s.title || "(session)", [
     { icon: "▶", label: "Open", action: () => openChat(s.sid) },
     { icon: "■", label: "Stop process", sub: "Keeps history; resumes on next message",
-      action: async () => { await api(`/api/sessions/${s.sid}/stop`, { method: "POST" }); toast("Stopped"); } },
+      action: async () => { await T.rpc("sessions.stop", { sid: s.sid }); toast("Stopped"); } },
     { icon: "✕", label: "Delete session", danger: true,
       action: () => confirmSheet(`Delete “${s.title || "session"}”?`, "This removes it from Claude RC. The Claude Code transcript on disk is kept.", async () => {
-        await api(`/api/sessions/${s.sid}`, { method: "DELETE" });
+        await T.rpc("sessions.delete", { sid: s.sid });
         delete S.events[s.sid]; S.subs.delete(s.sid); closeTab(s.sid);
         toast("Deleted");
       }) },
@@ -815,7 +790,7 @@ async function browseSheet(pick) {
   let current = null;
   const body = el("div");
   const load = async (path) => {
-    const data = await api("/api/browse" + (path ? `?path=${encodeURIComponent(path)}` : ""));
+    const data = await T.rpc("browse", path ? { path } : {});
     current = data.path;
     body.replaceChildren(
       el("div", { class: "sheet-title", style: "word-break:break-all" }, current.replace(S.home, "~")),
@@ -873,7 +848,7 @@ async function renderProject(path) {
   view.replaceChildren(wrap);
 
   try {
-    const { sessions } = await api(`/api/projects/sessions?cwd=${encodeURIComponent(path)}`);
+    const { sessions } = await T.rpc("projects.sessions", { cwd: path });
     const list = $("#past-list");
     if (!list) return;
     list.replaceChildren();
@@ -908,7 +883,7 @@ function pastSessionSheet(path, ps, opts) {
       el("div", { class: "notice" }, "loading preview…"))
   );
   rawSheet(body);
-  api(`/api/projects/preview?session_id=${ps.session_id}&cwd=${encodeURIComponent(path)}`)
+  T.rpc("projects.preview", { session_id: ps.session_id, cwd: path })
     .then(({ messages }) => {
       const peek = $("#peek");
       if (!peek) return;
@@ -921,9 +896,9 @@ function pastSessionSheet(path, ps, opts) {
 
 async function startSession(cwd, opts) {
   try {
-    const snap = await api("/api/sessions", {
-      method: "POST",
-      body: JSON.stringify({ cwd, model: opts.model, mode: opts.mode, resume: opts.resume || null, fork: !!opts.fork, title: opts.title || "" }),
+    const snap = await T.rpc("sessions.create", {
+      cwd, model: opts.model, mode: opts.mode,
+      resume: opts.resume || null, fork: !!opts.fork, title: opts.title || "",
     });
     upsertSession(snap);
     openChat(snap.sid);
@@ -1185,10 +1160,7 @@ function openTerm(sid, mount, overlay) {
   fit.fit();
   termUI.term = term;
 
-  const t = localStorage.getItem("bcrc_token");
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/term/${sid}`
-    + (t ? `?token=${encodeURIComponent(t)}` : ""));
+  const ws = T.openTerm(sid);
   ws.binaryType = "arraybuffer";
   termUI.ws = ws;
 
@@ -1763,7 +1735,7 @@ function infoSheet(sid) {
     el("button", { class: "btn", onclick: () => { closeSheet(); wsSend({ type: "compact", session_id: sid, instructions: "" }); } }, "Compact"),
     el("button", { class: "btn", onclick: () => { closeSheet(); confirmClear(sid); } }, "Clear"),
     el("button", { class: "btn", onclick: () => { closeSheet(); wsSend({ type: "refresh_context", session_id: sid }); } }, "Refresh"),
-    el("button", { class: "btn danger", onclick: async () => { closeSheet(); await api(`/api/sessions/${sid}/stop`, { method: "POST" }); } }, "Stop process")));
+    el("button", { class: "btn danger", onclick: async () => { closeSheet(); await T.rpc("sessions.stop", { sid }); } }, "Stop process")));
   rawSheet(body);
 }
 
@@ -1879,25 +1851,32 @@ if (window.visualViewport) {
 // ---------------------------------------------------------------- boot
 
 async function boot() {
-  // token from QR link
-  const params = new URLSearchParams(location.search);
-  if (params.get("token")) {
-    const token = params.get("token");
-    try {
-      await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) })
-        .then((r) => { if (r.ok) localStorage.setItem("bcrc_token", token); });
-    } catch {}
-    history.replaceState(null, "", location.pathname + location.hash);
+  if (!T) {
+    T = await makeTransport(); // transport.js; GET /api/env picks the mode
+    T.onMessage(handleWS);
+    T.onStatus(onTransportStatus);
   }
+
+  // one-time login code from the QR link — fragment only, never query strings
+  const mLogin = (location.hash || "").match(/^#login=([A-Za-z0-9_-]+)$/);
+  if (mLogin) {
+    history.replaceState(null, "", location.pathname);
+    try {
+      await fetch("/api/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: mLogin[1] }),
+      });
+    } catch {}
+  }
+
   try {
-    const state = await api("/api/state");
+    const state = await T.rpc("state");
     S.authed = true;
     S.sessions = state.sessions;
     S.defaults = state.defaults;
     S.home = state.home;
     for (const s of S.sessions) S.status[s.sid] = { state: s.state, detail: s.detail };
     pruneTabs();
-    wsConnect();
     // warm caches so home and the drawer paint instantly
     loadProjects().then(() => { if (S.view?.name === "home") renderHome(); }).catch(() => {});
     loadLibrary().catch(() => {});

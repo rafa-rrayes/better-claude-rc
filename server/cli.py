@@ -40,9 +40,13 @@ def _serve(args: argparse.Namespace) -> None:
         print(f"  {label:28s} {url}")
     print(f"\n  Auth token: {cfg.token}")
 
+    # One-time login code (2 min, single use). It travels in the URL
+    # *fragment* — never in a query string — and the QR never carries the
+    # long-term token.
     from . import main as main_mod
-    primary = urls[0][1] + f"/?token={cfg.token}"
-    print(f"\n  One-tap login URL:\n  {primary}\n")
+    code = main_mod.issue_login_code()
+    primary = urls[0][1] + f"/#login={code}"
+    print(f"\n  One-tap login link (valid 2 min, single use):\n  {primary}\n")
 
     if not args.no_qr:
         try:

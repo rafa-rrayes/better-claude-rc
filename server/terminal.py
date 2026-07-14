@@ -18,6 +18,7 @@ import contextlib
 import fcntl
 import os
 import pty
+import re
 import shutil
 import signal
 import struct
@@ -177,6 +178,8 @@ class TerminalManager:
 def claude_argv(resume_id: str, model: str, mode: str) -> list[str]:
     """Command line for a TUI that continues the given claude session with
     the webapp session's model/mode settings."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", resume_id or ""):
+        raise TerminalError("invalid resume session id")
     exe = shutil.which("claude")
     if not exe:
         raise TerminalError("claude CLI not found on PATH")

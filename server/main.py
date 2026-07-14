@@ -1,4 +1,4 @@
-"""FastAPI app: auth, REST API, multiplexed WebSocket, static frontend."""
+"""FastAPI app: auth, REST wrappers over rpc, WebSockets, static frontend."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import asyncio
 import contextlib
 import hmac
 import json
+import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import (
     Depends,
@@ -21,12 +24,12 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import library, projects
+from . import VERSION, rpc
 from .config import Config
-from .sessions import BUSY_STATES, MODEL_CHOICES, PERMISSION_MODES, SessionManager
+from .rpc import RpcError
+from .sessions import BUSY_STATES, SessionManager
 from .terminal import TerminalError, TerminalManager, claude_argv
 
-VERSION = "0.1.0"
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
 config = Config.load()
@@ -47,6 +50,26 @@ app = FastAPI(title="Better Claude RC", lifespan=lifespan)
 
 COOKIE = "bcrc_token"
 
+# One-time login codes (QR link): 2 minutes, single use. The link carries the
+# code in the URL *fragment* — no secrets in query strings, ever.
+LOGIN_CODE_TTL = 120.0
+_login_codes: dict[str, float] = {}
+
+
+def issue_login_code() -> str:
+    now = time.time()
+    for c, exp in list(_login_codes.items()):
+        if exp < now:
+            _login_codes.pop(c, None)
+    code = secrets.token_urlsafe(16)
+    _login_codes[code] = now + LOGIN_CODE_TTL
+    return code
+
+
+def _redeem_login_code(code: str) -> bool:
+    exp = _login_codes.pop(code, None)  # single use
+    return exp is not None and time.time() <= exp
+
 
 def _token_ok(token: str | None) -> bool:
     return bool(token) and hmac.compare_digest(token, config.token)
@@ -56,7 +79,7 @@ def _request_token(request: Request) -> str | None:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return request.cookies.get(COOKIE) or request.query_params.get("token")
+    return request.cookies.get(COOKIE)
 
 
 async def require_auth(request: Request) -> None:
@@ -74,7 +97,9 @@ def mgr() -> SessionManager:
 @app.post("/api/login")
 async def login(request: Request, response: Response):
     body = await request.json()
-    if not _token_ok(body.get("token")):
+    code = body.get("code")
+    ok = _redeem_login_code(code) if code else _token_ok(body.get("token"))
+    if not ok:
         raise HTTPException(status_code=401, detail="bad token")
     response.set_cookie(
         COOKIE, config.token, max_age=180 * 24 * 3600,
@@ -89,92 +114,71 @@ async def logout(response: Response):
     return {"ok": True}
 
 
-# ---------------- state / sessions ----------------
+@app.get("/api/env")
+async def api_env():
+    """Boot-time transport selection for the PWA (no auth needed)."""
+    return {"mode": "local"}
+
+
+# ---------------- REST wrappers over the rpc method table ----------------
+# Kept for curl and local debugging; the PWA talks rpc over /ws.
+
+async def _rest(method: str, params: dict):
+    try:
+        return await rpc.dispatch(mgr(), config, method, params)
+    except RpcError as e:
+        raise HTTPException(status_code=rpc.HTTP_STATUS.get(e.code, 500),
+                            detail=e.message)
+
 
 @app.get("/api/state", dependencies=[Depends(require_auth)])
 async def state():
-    return {
-        "ok": True,
-        "version": VERSION,
-        "home": str(Path.home()),
-        "sessions": mgr().snapshots(),
-        "defaults": {"models": MODEL_CHOICES, "modes": PERMISSION_MODES},
-    }
+    return await _rest("state", {})
 
 
 @app.post("/api/sessions", dependencies=[Depends(require_auth)])
 async def create_session(request: Request):
-    body = await request.json()
-    cwd = body.get("cwd", "")
-    if not cwd or not Path(cwd).is_dir():
-        raise HTTPException(status_code=400, detail="cwd is not a directory")
-    runner = await mgr().create(
-        cwd=cwd,
-        model=body.get("model", "default"),
-        mode=body.get("mode", "default"),
-        resume=body.get("resume"),
-        fork=bool(body.get("fork")),
-        title=body.get("title", ""),
-    )
-    return runner.snapshot()
+    return await _rest("sessions.create", await request.json())
 
 
 @app.post("/api/sessions/{sid}/stop", dependencies=[Depends(require_auth)])
 async def stop_session(sid: str):
-    runner = mgr().get(sid)
-    if runner is None:
-        raise HTTPException(status_code=404, detail="no such session")
-    await runner.stop()
-    return runner.snapshot()
+    return await _rest("sessions.stop", {"sid": sid})
 
 
 @app.delete("/api/sessions/{sid}", dependencies=[Depends(require_auth)])
 async def delete_session(sid: str):
-    await mgr().delete(sid)
-    return {"ok": True}
+    return await _rest("sessions.delete", {"sid": sid})
 
-
-# ---------------- discovery ----------------
 
 @app.get("/api/projects", dependencies=[Depends(require_auth)])
 async def api_projects():
-    return {"projects": await asyncio.to_thread(projects.recent_projects)}
+    return await _rest("projects.recent", {})
 
 
 @app.get("/api/projects/sessions", dependencies=[Depends(require_auth)])
 async def api_project_sessions(cwd: str):
-    return {"sessions": await asyncio.to_thread(projects.past_sessions, cwd)}
+    return await _rest("projects.sessions", {"cwd": cwd})
 
 
 @app.get("/api/projects/preview", dependencies=[Depends(require_auth)])
 async def api_session_preview(session_id: str, cwd: str | None = None):
-    return {"messages": await asyncio.to_thread(
-        projects.session_preview, session_id, cwd)}
+    return await _rest("projects.preview", {"session_id": session_id, "cwd": cwd})
 
 
 @app.get("/api/browse", dependencies=[Depends(require_auth)])
 async def api_browse(path: str | None = None):
-    return await asyncio.to_thread(projects.browse, path, config.browse_root)
+    return await _rest("browse", {"path": path})
 
 
 @app.get("/api/library", dependencies=[Depends(require_auth)])
 async def api_library(cwd: str | None = None):
-    return await asyncio.to_thread(library.get_library, cwd)
+    return await _rest("library", {"cwd": cwd})
 
 
 @app.get("/api/file", dependencies=[Depends(require_auth)])
 async def api_file(path: str):
-    p = Path(path).expanduser()
-    if not str(p.resolve()).startswith(config.browse_root):
-        raise HTTPException(status_code=403, detail="outside browse root")
-    if not p.is_file():
-        raise HTTPException(status_code=404, detail="not a file")
-    if p.stat().st_size > 512 * 1024:
-        raise HTTPException(status_code=413, detail="file too large")
-    try:
-        return {"path": str(p), "content": p.read_text(errors="replace")}
-    except OSError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return await _rest("file.read", {"path": path})
 
 
 # ---------------- websocket ----------------
@@ -204,13 +208,46 @@ class WSConn:
                 await self._sender
 
 
+def _origin_ok(ws: WebSocket) -> bool:
+    """Same-origin allowlist for browser WS upgrades. Non-browser clients
+    (no Origin header) pass — cross-site WebSocket hijacking is a browser
+    attack, and browsers always send Origin on WS upgrades."""
+    origin = ws.headers.get("origin")
+    if origin is None:
+        return True
+    try:
+        o = urlparse(origin)
+    except ValueError:
+        return False
+    if o.scheme not in ("http", "https") or not o.netloc:
+        return False
+    host = ws.headers.get("host", "")
+
+    def norm(netloc: str, scheme: str) -> str:
+        if ":" in netloc:
+            return netloc
+        return f"{netloc}:{443 if scheme == 'https' else 80}"
+
+    return norm(o.netloc, o.scheme) == norm(host, o.scheme)
+
+
+async def _ws_auth(ws: WebSocket) -> bool:
+    """Cookie-only WS auth (no tokens in query strings) + Origin allowlist.
+    Accepts the socket first so the browser can observe the close code."""
+    await ws.accept()
+    if not _token_ok(ws.cookies.get(COOKIE)):
+        await ws.close(code=4401)
+        return False
+    if not _origin_ok(ws):
+        await ws.close(code=4403)
+        return False
+    return True
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    token = ws.cookies.get(COOKIE) or ws.query_params.get("token")
-    if not _token_ok(token):
-        await ws.close(code=4401)
+    if not await _ws_auth(ws):
         return
-    await ws.accept()
     m = mgr()
     conn = WSConn(ws)
     conn.start()
@@ -240,6 +277,20 @@ async def handle_ws(m: SessionManager, conn: WSConn, msg: dict) -> None:
     mtype = msg.get("type")
     if mtype == "ping":
         conn.push({"type": "pong"})
+        return
+    if mtype == "rpc":
+        rid = msg.get("id")
+        try:
+            result = await rpc.dispatch(m, config, str(msg.get("method") or ""),
+                                        msg.get("params") or {})
+            conn.push({"type": "rpc_result", "id": rid, "ok": True,
+                       "result": result})
+        except RpcError as e:
+            conn.push({"type": "rpc_result", "id": rid, "ok": False,
+                       "error": {"code": e.code, "message": e.message}})
+        except Exception as e:
+            conn.push({"type": "rpc_result", "id": rid, "ok": False,
+                       "error": {"code": "internal", "message": str(e)}})
         return
     if mtype == "sessions":
         conn.push({"type": "sessions", "sessions": m.snapshots()})
@@ -317,11 +368,8 @@ async def ws_terminal(ws: WebSocket, sid: str):
     frames are raw terminal output; text frames are JSON control messages
     ({"type": "exit"|"pong"}). Client→server: JSON text frames
     ({"type": "input"|"resize"|"ping"|"kill"})."""
-    token = ws.cookies.get(COOKIE) or ws.query_params.get("token")
-    if not _token_ok(token):
-        await ws.close(code=4401)
+    if not await _ws_auth(ws):
         return
-    await ws.accept()
 
     async def bail(reason: str) -> None:
         await ws.send_json({"type": "exit", "reason": reason})
