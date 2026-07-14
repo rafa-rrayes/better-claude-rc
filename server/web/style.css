@@ -735,3 +735,12 @@ a { color: var(--accent); }
   background: var(--surface); border: 1px solid var(--border);
   color: var(--accent);
 }
+
+/* ------------------------------------------------ platform: pairing (M4) */
+.pair-video {
+  width: 100%; max-width: 320px; border-radius: 12px;
+  border: 1px solid var(--border); margin: 0 auto 12px; display: block;
+  background: #000;
+}
+.login-box .btn { margin-bottom: 10px; }
+.login-box input#pair-code { font-family: var(--mono); font-size: 12px; }

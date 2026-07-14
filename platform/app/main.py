@@ -72,6 +72,9 @@ async def security_headers(request: Request, call_next):
     resp.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        # 'wasm-unsafe-eval' lets the vendored libsodium.js compile its
+        # (inlined, same-origin) WebAssembly; no remote code is allowed.
+        "script-src 'self' 'wasm-unsafe-eval'; "
         "img-src 'self' data:; "
         f"connect-src 'self' wss://{host} ws://{host}; "
         "base-uri 'none'; frame-ancestors 'none'; form-action 'self'")

@@ -2,18 +2,22 @@
 ports) and bridges relay channels to the existing session/terminal engine.
 
 One WS uplink carries all browser clients, multiplexed by channel. The relay
-tags each open{} with an opaque per-client connection id, and the agent keeps
-one MuxConn per client so every DATA payload flows through that client's
-PayloadCodec — NullCodec today, E2ECodec in M4 (per-connection secretstream);
-swapping the codec_factory is the only change.
+tags each open{} with an opaque per-client connection id, and the agent
+keeps one MuxConn + one identity.AgentSession per client: every DATA payload
+flows through that session's E2ECodec (crypto_secretstream, keys from the
+per-connection handshake). Ciphertext is mandatory — a client that skips the
+handshake or sends plaintext gets CodecError → hard close. KIND_HS frames
+(pairing + session handshake JSON) ride the client's ctrl channel and are
+the only client bytes the agent reads before the codec is established.
 
 Channel kinds:
   ctrl — carries the existing /ws JSON vocabulary unchanged (attach/send/
          permission/rpc/…), dispatched through main.handle_ws. The agent
-         pushes hello + sessions on open, mirroring the local WS.
+         pushes hello + sessions once the handshake establishes, mirroring
+         the local WS.
   term — carries today's /ws/term traffic: ptype RAW = PTY output,
          ptype JSON = {input,resize,ping,kill,exit}. The sid arrives inside
-         the channel via {"type":"term_attach","sid":…} — the relay never
+         the ciphertext via {"type":"term_attach","sid":…} — the relay never
          learns session ids.
 
 Reliability (plan §reliability): full-jitter exponential backoff (cap 60s,
@@ -31,9 +35,9 @@ import random
 
 import websockets
 
-from . import VERSION, proto
+from . import VERSION, identity as identity_mod, proto
 from . import main as main_mod
-from .codec import CodecError, NullCodec
+from .codec import CodecError
 from .config import Config
 from .mux import ChannelClosed, MuxConn
 from .sessions import SessionManager
@@ -52,10 +56,10 @@ _FATAL_UNAUTHORIZED = (proto.CLOSE_UNAUTHORIZED, proto.CLOSE_FORBIDDEN)
 
 def agent_auth_header(machine_id: str, identity=None) -> str:
     """Signed header X-BCRC-Agent: <agent_id>.<ts>.<Ed25519 sig over
-    method|path|ts> (server/identity.py). Without an identity (DB-less dev
-    relay, loopback e2e) it degrades to the bare machine id, which a
-    production relay refuses."""
-    if identity is not None:
+    method|path|ts> (server/identity.py). An identity without a machine id
+    (never enrolled — DB-less dev relay, loopback e2e) degrades to the bare
+    machine id, which a production relay refuses."""
+    if identity is not None and identity.machine_id:
         return identity.auth_header("GET", "/agent/ws")
     return machine_id
 
@@ -156,13 +160,17 @@ class _RelayTermTransport:
 
 
 class ClientState:
-    """One relay-side browser connection: its MuxConn (codec) + channels."""
+    """One relay-side browser connection: its E2E session (codec), MuxConn
+    and channels. Nothing is pushed to the ctrl channel until the session
+    is established — the codec cannot seal before the handshake."""
 
-    def __init__(self, conn_id, mux: MuxConn):
+    def __init__(self, conn_id, mux: MuxConn, session):
         self.conn_id = conn_id
         self.mux = mux
+        self.session = session
         self.channels: set[int] = set()
         self.ctrl_ch: int | None = None
+        self.pending_ctrl: "ChannelConn | None" = None  # awaiting handshake
 
 
 # ---------------- the uplink ----------------
@@ -170,7 +178,7 @@ class ClientState:
 class Uplink:
     def __init__(self, manager: SessionManager, terms: TerminalManager,
                  config: Config, relay_url: str, machine_id: str, *,
-                 identity=None, codec_factory=NullCodec,
+                 identity, devices, pairing=None,
                  ping_interval: float = 20.0, ping_timeout: float = 25.0,
                  backoff_base: float = BACKOFF_BASE,
                  backoff_cap: float = BACKOFF_CAP):
@@ -180,7 +188,8 @@ class Uplink:
         self.relay_url = relay_url.rstrip("/")
         self.machine_id = machine_id
         self.identity = identity
-        self.codec_factory = codec_factory
+        self.devices = devices
+        self.pairing = pairing
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.backoff_base = backoff_base
@@ -191,6 +200,9 @@ class Uplink:
         self._welcomed = False
         self.clients: dict[object, ClientState] = {}
         self.channels: dict[int, tuple[ClientState, ChannelConn | TermChannel]] = {}
+        # devices.revoke (rpc revoke_device) also cuts live connections
+        identity_mod.set_active_devices(devices)
+        identity_mod.REVOKE_LISTENERS.append(self._on_device_revoked)
 
     # -------- reconnect loop --------
 
@@ -301,7 +313,8 @@ class Uplink:
                 log.warning("relay error: %s", msg)
             return
         if kind == proto.KIND_HS:
-            return  # M4 seam: pairing + session handshake frames
+            await self._handle_hs(ch, payload)
+            return
         entry = self.channels.get(ch)
         if entry is None:
             return  # racing a close
@@ -309,6 +322,9 @@ class Uplink:
         try:
             _k, _c, ptype, body = client.mux.decode(frame)
         except (proto.FrameError, CodecError):
+            # Tampered/replayed/plaintext frame: secretstream can never
+            # recover this channel's stream — hard-close the channel (the
+            # ctrl channel cascades to the whole client connection).
             await self.teardown_channel(ch, "bad frame", notify_relay=True)
             return
         if isinstance(chan, ChannelConn):
@@ -339,7 +355,69 @@ class Uplink:
             else:
                 chan.inbox.put_nowait(data)
 
+    # -------- E2E handshake (KIND_HS on the client's ctrl channel) --------
+
+    async def _handle_hs(self, ch: int, payload: bytes) -> None:
+        entry = self.channels.get(ch)
+        if entry is None:
+            return  # racing a close
+        client, chan = entry
+        if ch != client.ctrl_ch or not isinstance(chan, ChannelConn):
+            await self._hs_refuse(client, ch, "protocol")
+            return
+        try:
+            msg = json.loads(payload)
+            if not isinstance(msg, dict):
+                raise ValueError
+        except ValueError:
+            await self._hs_refuse(client, ch, "protocol")
+            return
+        try:
+            reply = client.session.handle_hs(msg)
+        except identity_mod.HandshakeError as e:
+            await self._hs_refuse(client, ch, e.code)
+            return
+        if reply is not None:
+            # hs2 must hit the wire before any sealed frame so the device
+            # has keys when the first DATA arrives — send it inline, not
+            # through the mux pump.
+            with contextlib.suppress(Exception):
+                await self._ws_send(proto.pack_frame(
+                    proto.KIND_HS, ch, json.dumps(reply).encode()))
+        if client.session.established and client.pending_ctrl is not None:
+            self._activate_ctrl(client, client.pending_ctrl)
+            client.pending_ctrl = None
+
+    async def _hs_refuse(self, client: ClientState, ch: int,
+                         code: str) -> None:
+        log.info("handshake refused (%s) for client %s", code,
+                 client.conn_id)
+        with contextlib.suppress(Exception):
+            await self._ws_send(proto.pack_frame(
+                proto.KIND_HS, ch,
+                json.dumps({"type": "hs_err", "code": code}).encode()))
+        ctrl = client.ctrl_ch if client.ctrl_ch is not None else ch
+        await self.teardown_channel(ctrl, "handshake refused",
+                                    notify_relay=True)
+
+    def _on_device_revoked(self, device_pk_b64: str) -> None:
+        """identity.Devices.revoke() listener: cut live connections of the
+        revoked device (second revocation layer, plan §threat model)."""
+        for client in list(self.clients.values()):
+            if client.session.device_pk_b64 == device_pk_b64 \
+                    and client.ctrl_ch is not None:
+                asyncio.get_running_loop().create_task(
+                    self.teardown_channel(client.ctrl_ch, "device revoked",
+                                          notify_relay=True))
+
     # -------- channel lifecycle --------
+
+    def _activate_ctrl(self, client: ClientState, chan: "ChannelConn") -> None:
+        """Handshake done: only now may the ctrl channel carry (sealed)
+        broadcasts. Mirrors what the local WS pushes on connect."""
+        self.manager.conns.add(chan)
+        chan.push({"type": "hello", "version": VERSION})
+        chan.push({"type": "sessions", "sessions": self.manager.snapshots()})
 
     def _open_channel(self, msg: dict) -> None:
         ch = int(msg.get("ch") or 0)
@@ -351,21 +429,23 @@ class Uplink:
             return
         client = self.clients.get(conn_id)
         if client is None:
+            session = identity_mod.AgentSession(self.identity, self.devices,
+                                                self.pairing)
             mux = MuxConn(
-                self._ws_send, codec=self.codec_factory(),
+                self._ws_send, codec=session.codec,
                 on_channel_close=lambda c, why: self._on_mux_close(c, why))
             mux.start()
-            client = ClientState(conn_id, mux)
+            client = ClientState(conn_id, mux, session)
             self.clients[conn_id] = client
         if kind_ == "ctrl":
             chan: ChannelConn | TermChannel = ChannelConn(client, ch)
             client.ctrl_ch = ch
             self.channels[ch] = (client, chan)
             client.channels.add(ch)
-            self.manager.conns.add(chan)
-            chan.push({"type": "hello", "version": VERSION})
-            chan.push({"type": "sessions",
-                       "sessions": self.manager.snapshots()})
+            if client.session.established:
+                self._activate_ctrl(client, chan)
+            else:
+                client.pending_ctrl = chan  # after the handshake
         else:
             chan = TermChannel(client, ch)
             self.channels[ch] = (client, chan)
@@ -388,9 +468,12 @@ class Uplink:
         client.channels.discard(ch)
         if isinstance(chan, ChannelConn):
             self.manager.conns.discard(chan)
+            if client.pending_ctrl is chan:
+                client.pending_ctrl = None
         else:
             chan.inbox.put_nowait(None)  # unblocks attach_terminal
         client.mux.close_channel(ch, reason)
+        client.session.codec.drop_channel(ch)
         if notify_relay and self._ws is not None:
             self._send_ctrl_soon({"type": "close", "ch": ch,
                                   "reason": reason})

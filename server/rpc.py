@@ -141,6 +141,24 @@ async def _file_read(m: SessionManager, config: Config, params: dict) -> dict:
         raise RpcError("bad_request", str(e))
 
 
+async def _devices_list(m: SessionManager, config: Config, params: dict) -> dict:
+    """Paired phones (devices.json). Agent-side truth — the platform never
+    learns which devices exist."""
+    from . import identity
+    return {"devices": identity.active_devices().snapshot()}
+
+
+async def _devices_revoke(m: SessionManager, config: Config, params: dict) -> dict:
+    """Revoke a paired device by its Ed25519 public key. Removes it from
+    devices.json and tears down its live relay connections (the second
+    revocation layer of the plan's threat model)."""
+    from . import identity
+    pk = _require_str(params, "device_pk")
+    if not identity.active_devices().revoke(pk):
+        raise RpcError("not_found", "no such device")
+    return {"ok": True}
+
+
 METHODS = {
     "state": _state,
     "sessions.create": _sessions_create,
@@ -152,6 +170,9 @@ METHODS = {
     "browse": _browse,
     "library": _library,
     "file.read": _file_read,
+    "devices.list": _devices_list,
+    "devices.revoke": _devices_revoke,
+    "revoke_device": _devices_revoke,  # plan-named alias
 }
 
 

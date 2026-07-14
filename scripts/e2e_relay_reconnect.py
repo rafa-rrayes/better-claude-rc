@@ -1,13 +1,16 @@
 """Relay chaos e2e: reliability invariants through relay restarts and agent
-freezes (plan §reliability).
+freezes (plan §reliability), with the REAL E2E layer (M4): the device pairs
+via the QR code the agent subprocess printed to its terminal, then every
+reconnect runs a fresh handshake before sealed traffic resumes.
 
   1. Kill + restart the relay MID-TURN: the agent reconnects (full-jitter
-     backoff), the client reconnects, and attach{since_seq} replay yields a
-     gap-free seq sequence — no event lost, the turn's result arrives.
+     backoff), the client reconnects (fresh handshake), and
+     attach{since_seq} replay yields a gap-free seq sequence — no event
+     lost, the turn's result arrives.
   2. SIGSTOP the agent: relay pings go unanswered → link reaped →
      machine_status{online:false} flows to the client. SIGCONT → agent
-     reconnects → machine_status{online:true}; channels reopen and
-     attach{since_seq} still replays clean.
+     reconnects → machine_status{online:true}; channels reopen (fresh
+     handshake again) and attach{since_seq} still replays clean.
 
 The agent runs `server.cli connect` as a real subprocess (so it can be
 SIGSTOPped); the relay runs in-process with 1s/2s WS keepalive so reaping is
@@ -16,6 +19,7 @@ fast. Costs one haiku turn. Run: uv run python scripts/e2e_relay_reconnect.py
 
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,7 +32,7 @@ sys.path.insert(0, str(ROOT))
 import uvicorn  # noqa: E402
 
 from app.main import app as platform_app  # noqa: E402
-from relay_client import FakeClient  # noqa: E402
+from relay_client import DeviceSim, FakeClient  # noqa: E402
 
 HOST, RPORT, APORT = "127.0.0.1", 8809, 8810
 RELAY = f"ws://{HOST}:{RPORT}"
@@ -68,14 +72,31 @@ def start_agent(data_dir: str) -> subprocess.Popen:
            "BCRC_PING_TIMEOUT": "2"}
     logf = open(Path(data_dir) / "agent.log", "wb")
     return subprocess.Popen(
-        [sys.executable, "-m", "server.cli", "connect",
+        [sys.executable, "-u", "-m", "server.cli", "connect", "--no-qr",
          "--relay", RELAY, "--port", str(APORT)],
         cwd=str(ROOT), env=env,
         stdout=logf, stderr=subprocess.STDOUT)
 
 
-async def open_ctrl(c: FakeClient) -> int:
+async def read_pairing_code(data_dir: str, timeout: float = 30.0) -> str:
+    """First run prints the pairing code (BCRC1.…) to the agent terminal —
+    exactly what a user would scan/paste. Fish it out of the log."""
+    log_path = Path(data_dir) / "agent.log"
+    deadline = asyncio.get_running_loop().time() + timeout
+    pat = re.compile(r"(BCRC1\.[^.\s]+\.[^.\s]+\.[^.\s]+)")
+    while asyncio.get_running_loop().time() < deadline:
+        if log_path.exists():
+            match = pat.search(log_path.read_text(errors="replace"))
+            if match:
+                return match.group(1)
+        await asyncio.sleep(0.2)
+    raise AssertionError("agent never printed a pairing code")
+
+
+async def open_ctrl(c: FakeClient, pair_qr: str | None = None) -> int:
+    """Open the ctrl channel + fresh E2E handshake (pairing on first use)."""
     ctrl = await c.open("ctrl")
+    await c.handshake(ctrl, pair_qr=pair_qr)
     await c.wait_type(ctrl, "hello")
     await c.wait_type(ctrl, "sessions")
     return ctrl
@@ -103,12 +124,18 @@ async def main():
     saw_result = False
 
     try:
+        # ---- phase 0: pair the device with the code the agent printed
+        qr = await read_pairing_code(data_dir)
+        dev = DeviceSim()
+        print(f"pairing code captured from agent terminal ({qr[:24]}…)")
+
         # ---- phase 1: connect, create a session, start a turn
-        c = FakeClient(RELAY, MACHINE)
+        c = FakeClient(RELAY, MACHINE, device=dev)
         await c.connect()
         await c.wait_status(True, timeout=30)
         print("agent subprocess online through relay")
-        ctrl = await open_ctrl(c)
+        ctrl = await open_ctrl(c, pair_qr=qr)
+        print("device paired + E2E handshake established")
         r = await c.rpc(ctrl, "sessions.create",
                         {"cwd": CWD, "model": "haiku", "title": "reconn-e2e"})
         assert r["ok"], r
@@ -138,7 +165,8 @@ async def main():
         print("relay restarted")
 
         # ---- client + agent both reconnect; attach{since_seq} replays
-        c2 = FakeClient(RELAY, MACHINE)
+        # (same paired device, fresh per-connection handshake)
+        c2 = FakeClient(RELAY, MACHINE, device=dev)
         await c2.connect(timeout=30)
         await c2.wait_status(True, timeout=60)
         print("agent re-connected to the new relay")

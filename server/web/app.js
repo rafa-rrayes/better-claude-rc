@@ -235,6 +235,14 @@ function onTransportStatus(st) {
   S.wsUp = !!st.up;
   updateConnUI();
   if (st.authRequired) { S.authed = false; nav({ name: "login" }); return; }
+  if (st.pairRequired) {
+    // the agent no longer trusts this device (revoked / never paired)
+    const mid = localStorage.getItem("bcrc_machine");
+    try { T?.close(); } catch {}
+    T = null;
+    if (mid) renderPairScreen(mid);
+    return;
+  }
   if (st.up) {
     if (S.mode === "platform" && !S._stateLoaded) { finishBoot(); }
     for (const sid of S.subs) {
@@ -445,6 +453,12 @@ function openDrawer() {
             refreshMachines().finally(() => renderMachinePicker());
           } }, "machines")
         : null,
+      S.mode === "platform"
+        ? el("button", { class: "foot-btn", onclick: () => {
+            closeDrawer();
+            renderDevicesScreen();
+          } }, "devices")
+        : null,
       el("button", { class: "foot-btn", onclick: doLogout }, "log out"))));
   $("#drawer-root").append(backdrop);
   loadLibrary().then(() => {
@@ -633,14 +647,183 @@ async function showEnrollCommand() {
   }
 }
 
-function connectMachine(mid) {
+async function connectMachine(mid, pairing) {
   localStorage.setItem("bcrc_machine", mid);
+  let session = null;
+  try {
+    // E2E session: device identity + pinned agent key (crypto.js).
+    session = await BcrcCrypto.session(mid, pairing || null);
+  } catch (e) {
+    toast("Crypto init failed: " + (e.message || e), true);
+    return;
+  }
+  if (!session) { renderPairScreen(mid); return; } // not paired yet
   if (T) { try { T.close(); } catch {} }
-  T = new RelayTransport(mid);
+  T = new RelayTransport(mid, session);
   T.onMessage(handleWS);
   T.onStatus(onTransportStatus);
   T.connect();
   finishBoot();
+}
+
+// -------- pairing screen (scan the agent terminal's QR / paste the code) --
+
+let _scanStop = null;
+
+function stopScanner() {
+  if (_scanStop) { try { _scanStop(); } catch {} _scanStop = null; }
+}
+
+function renderPairScreen(mid) {
+  stopScanner();
+  setTopbar();
+  const err = el("div", { class: "login-err", id: "pair-err" });
+  const video = el("video", { class: "pair-video", playsinline: "",
+    muted: "", style: "display:none" });
+  const paste = el("input", { type: "text", id: "pair-code",
+    placeholder: "BCRC1.…", autocapitalize: "none", autocorrect: "off",
+    spellcheck: "false" });
+  $("#view").replaceChildren(
+    el("div", { class: "login-box" },
+      el("div", { class: "glyph" }, "❯_"),
+      el("h1", null, "Pair this machine"),
+      el("p", null, "In the terminal on that computer, better-claude-rc "
+        + "connect shows a QR code and a pairing code. Scan or paste it "
+        + "here — it never touches the server."),
+      video,
+      el("button", { class: "btn", onclick: () =>
+        startScanner(video, err, (code) => submitPairing(mid, code)) },
+        "Scan QR with camera"),
+      paste,
+      el("button", { class: "btn primary",
+        onclick: () => submitPairing(mid, paste.value) }, "Pair"),
+      el("button", { class: "btn", onclick: () => {
+        stopScanner(); refreshMachines().finally(() => renderMachinePicker());
+      } }, "Back"),
+      err));
+}
+
+async function submitPairing(mid, code) {
+  const qr = BcrcCrypto.parseQr(code);
+  const errEl = $("#pair-err");
+  if (!qr) {
+    if (errEl) errEl.textContent = "That doesn't look like a pairing code";
+    return;
+  }
+  if (qr.agentId !== mid) {
+    if (errEl) errEl.textContent = "This code belongs to a different machine";
+    return;
+  }
+  stopScanner();
+  toast("Pairing…");
+  await connectMachine(mid, qr);
+}
+
+async function startScanner(video, err, onCode) {
+  stopScanner();
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(
+      { video: { facingMode: "environment" } });
+  } catch (e) {
+    err.textContent = "Camera unavailable — paste the code instead";
+    return;
+  }
+  video.srcObject = stream;
+  video.style.display = "block";
+  try { await video.play(); } catch {}
+  let stopped = false;
+  _scanStop = () => {
+    stopped = true;
+    stream.getTracks().forEach((t) => t.stop());
+    video.style.display = "none";
+    video.srcObject = null;
+  };
+  const detector = "BarcodeDetector" in window
+    ? new BarcodeDetector({ formats: ["qr_code"] }) : null;
+  const jsqr = detector ? null : await BcrcCrypto.jsQR().catch(() => null);
+  if (!detector && !jsqr) {
+    err.textContent = "No QR scanner available — paste the code instead";
+    stopScanner();
+    return;
+  }
+  const canvas = document.createElement("canvas");
+  const tick = async () => {
+    if (stopped) return;
+    if (video.readyState >= 2 && video.videoWidth) {
+      try {
+        let text = null;
+        if (detector) {
+          const codes = await detector.detect(video);
+          if (codes.length) text = codes[0].rawValue;
+        } else {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          ctx.drawImage(video, 0, 0);
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const res = jsqr(img.data, img.width, img.height);
+          if (res && res.data) text = res.data;
+        }
+        if (text && text.startsWith("BCRC1.")) {
+          stopScanner();
+          onCode(text);
+          return;
+        }
+      } catch {}
+    }
+    setTimeout(tick, 250);
+  };
+  tick();
+}
+
+// -------- paired devices management (agent-side registry via rpc) --------
+
+async function renderDevicesScreen() {
+  setTopbar(menuBtn(), tbTitle("Devices"), el("div", { class: "tb-spacer" }));
+  const view = $("#view");
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Paired Devices"),
+    el("div", { class: "empty" }, "Loading…")));
+  let devices;
+  try {
+    devices = (await T.rpc("devices.list")).devices || [];
+  } catch (e) {
+    view.replaceChildren(el("div", { class: "pad" },
+      el("div", { class: "empty" }, "Could not load devices: " + e.message)));
+    return;
+  }
+  const mine = T && T.session ? T.session.devicePkB64 : null;
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Paired Devices"),
+    devices.length
+      ? el("div", { class: "vs-list" }, devices.map((d) => bigItem({
+          icon: "▣",
+          title: (d.name || "device") + (d.device_pk === mine ? " · this device" : ""),
+          sub: d.device_pk.slice(0, 20) + "…",
+          side: "revoke",
+          onclick: async () => {
+            if (!confirm("Revoke this device? It loses access immediately."))
+              return;
+            try {
+              await T.rpc("devices.revoke", { device_pk: d.device_pk });
+            } catch (e) {
+              if (d.device_pk !== mine) {  // self-revoke kills the pipe
+                toast(e.message || "Revoke failed", true);
+                return;
+              }
+            }
+            toast("Device revoked");
+            if (d.device_pk === mine) doLogout();
+            else renderDevicesScreen();
+          },
+        })))
+      : el("div", { class: "empty" },
+          "No paired devices. Run better-claude-rc connect --pair on the "
+          + "machine to pair another phone."),
+    el("div", { class: "notice", style: "margin-top:12px" },
+      "Devices are stored on the machine itself (devices.json) — the "
+      + "platform never sees them.")));
 }
 
 async function doLogin() {

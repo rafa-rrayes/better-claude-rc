@@ -128,6 +128,25 @@ async def main():
         assert r["ok"] and r["result"]["ok"], r
         print(f"sessions.create/stop/delete ok — sid {sid}")
 
+        # ---- devices.list / devices.revoke / revoke_device (M4 registry)
+        import tempfile
+
+        from server import identity as idm
+        from server.identity import Devices
+        devdir = Path(tempfile.mkdtemp(prefix="bcrc-rpc-devs-"))
+        registry = Devices.load(devdir / "devices.json")
+        fake_pk = "A" * 43 + "="  # b64 of 32 bytes, shape only
+        registry.add(fake_pk, "rpc-e2e-phone")
+        idm.set_active_devices(registry)
+        r = await rpc(ws, "devices.list")
+        assert r["ok"] and any(d["device_pk"] == fake_pk
+                               for d in r["result"]["devices"]), r
+        r = await rpc(ws, "devices.revoke", {"device_pk": fake_pk})
+        assert r["ok"] and not registry.is_paired(fake_pk), r
+        r = await rpc(ws, "revoke_device", {"device_pk": fake_pk})
+        assert not r["ok"] and r["error"]["code"] == "not_found", r
+        print("devices.list/revoke ok — list, revoke, alias not_found")
+
         # ---- error paths
         r = await rpc(ws, "sessions.create", {"cwd": "/etc"})
         assert not r["ok"] and r["error"]["code"] == "forbidden", \

@@ -127,51 +127,66 @@ class LocalTransport {
 
 /* ---------------- relay wire format (plan §wire format) ----------------
    byte 0 ver=1 | byte 1 kind (0 CTRL, 1 HS, 2 DATA) | bytes 2-5 ch u32 BE.
-   DATA payload plaintext: [1B ptype: 0 raw | 1 json][body]. */
+   DATA payload = codec-sealed [1B ptype: 0 raw | 1 json][body]; the 6-byte
+   header is the AEAD associated data (tampered routing = failed auth). */
 
 const MUX = { VER: 1, CTRL: 0, HS: 1, DATA: 2, PT_RAW: 0, PT_JSON: 1 };
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
+function muxHeader(kind, ch) {
+  return new Uint8Array([MUX.VER, kind,
+    (ch >>> 24) & 255, (ch >>> 16) & 255, (ch >>> 8) & 255, ch & 255]);
+}
+
 function muxFrame(kind, ch, payload) {
   const buf = new Uint8Array(6 + payload.length);
-  buf[0] = MUX.VER; buf[1] = kind;
-  buf[2] = (ch >>> 24) & 255; buf[3] = (ch >>> 16) & 255;
-  buf[4] = (ch >>> 8) & 255; buf[5] = ch & 255;
+  buf.set(muxHeader(kind, ch));
   buf.set(payload, 6);
   return buf;
 }
 
-function muxParse(data) { // ArrayBuffer -> {kind, ch, payload} | null
+function muxParse(data) { // ArrayBuffer -> {kind, ch, hdr, payload} | null
   const b = new Uint8Array(data);
   if (b.length < 6 || b[0] !== MUX.VER) return null;
   return {
     kind: b[1],
     ch: ((b[2] << 24) | (b[3] << 16) | (b[4] << 8) | b[5]) >>> 0,
+    hdr: b.subarray(0, 6),
     payload: b.subarray(6),
   };
 }
 
-/* NullCodec: plaintext passthrough. M4 replaces this with the secretstream
-   codec (same seal/open interface; header is the AEAD associated data). */
+/* Plaintext passthrough for DB-less local dev of the relay path only.
+   Platform mode always runs the E2E session codec from crypto.js —
+   the agent hard-refuses plaintext DATA frames. */
 const NullCodecJS = {
   seal(header, plaintext) { return plaintext; },
   open(header, ciphertext) { return ciphertext; },
+  dropChannel(ch) {},
 };
 
 function dataJsonStr(ch, str, codec) {
   const body = _enc.encode(str);
   const pl = new Uint8Array(1 + body.length);
   pl[0] = MUX.PT_JSON; pl.set(body, 1);
-  const frame = muxFrame(MUX.DATA, ch, codec.seal(null, pl));
+  const header = muxHeader(MUX.DATA, ch);
+  const sealed = codec.seal(header, pl);
+  const frame = new Uint8Array(6 + sealed.length);
+  frame.set(header);
+  frame.set(sealed, 6);
   return frame;
 }
 
 class RelayTransport {
-  constructor(machineId, codec) {
+  /* session: a BcrcCrypto session (crypto.js) — owns the pairing/handshake
+     state machine and the secretstream codec. Every ctrl-channel (re)open
+     runs a fresh handshake before the transport reports up. */
+  constructor(machineId, session) {
     this.machine = machineId;
-    this.codec = codec || NullCodecJS;
-    this.up = false;          // ctrl channel open AND machine online
+    this.session = session || null;
+    this.codec = session ? session.codec : NullCodecJS;
+    this.up = false;          // ctrl channel open AND handshake established
     this.online = false;      // last machine_status
     this.plan = null;
     this.ws = null;
@@ -247,8 +262,11 @@ class RelayTransport {
       this._onCtrl(msg);
       return;
     }
-    if (f.kind !== MUX.DATA) return; // HS = M4 handshake seam
-    const pl = this.codec.open(null, f.payload);
+    if (f.kind === MUX.HS) { this._onHS(f); return; }
+    if (f.kind !== MUX.DATA) return;
+    let pl;
+    try { pl = this.codec.open(f.hdr, f.payload); }
+    catch { return; } // stale channel after re-handshake / corrupt frame
     if (!pl || !pl.length) return;
     const ptype = pl[0], body = pl.subarray(1);
     if (f.ch === this.ctrlCh) {
@@ -284,17 +302,24 @@ class RelayTransport {
         if (msg.kind === "ctrl") {
           this.ctrlCh = msg.ch;
           this._ctrlPending = false;
-          this.up = true;
-          this._retry = 0;
-          const q = this._sendQueue; this._sendQueue = [];
-          for (const obj of q) this._dataSend(obj);
-          this._emitStatus({ up: true });
+          if (this.session) {
+            // fresh E2E handshake on every ctrl (re)open; the transport
+            // reports up only once the codec is established
+            try { this._sendHS(this.session.begin()); }
+            catch (e) {
+              this._emitStatus({ up: false, hsError: String((e && e.message) || e) });
+            }
+          } else {
+            this._secured();
+          }
         } else {
           const sock = req.sock;
           sock.ch = msg.ch;
           this._termSocks.set(msg.ch, sock);
-          this.ws.send(dataJsonStr(msg.ch,
-            JSON.stringify({ type: "term_attach", sid: req.sid }), this.codec));
+          try {
+            this.ws.send(dataJsonStr(msg.ch,
+              JSON.stringify({ type: "term_attach", sid: req.sid }), this.codec));
+          } catch { this._termSocks.delete(msg.ch); this._termClosed(sock); break; }
           sock.readyState = 1;
           if (sock.onopen) sock.onopen({});
         }
@@ -302,6 +327,7 @@ class RelayTransport {
       }
       case "close": {
         const ch = msg.ch;
+        this.codec.dropChannel(ch);
         if (ch === this.ctrlCh) {
           this.ctrlCh = null;
           this.up = false;
@@ -337,6 +363,40 @@ class RelayTransport {
     return i < 0 ? null : this._pendingOpens.splice(i, 1)[0];
   }
 
+  /* -------- E2E handshake plumbing (HS frames on the ctrl channel) ----- */
+
+  _sendHS(msg) {
+    if (this.ws && this.ws.readyState === 1 && this.ctrlCh !== null) {
+      this.ws.send(muxFrame(MUX.HS, this.ctrlCh,
+        _enc.encode(JSON.stringify(msg))));
+    }
+  }
+
+  _onHS(f) {
+    if (!this.session || f.ch !== this.ctrlCh) return;
+    let msg; try { msg = JSON.parse(_dec.decode(f.payload)); } catch { return; }
+    let r;
+    try { r = this.session.handle(msg); }
+    catch (e) { r = { error: String((e && e.message) || e) }; }
+    if (r.reply) this._sendHS(r.reply);
+    if (r.established) this._secured();
+    if (r.error) {
+      this.up = false;
+      this._failPending(new Error("handshake failed: " + r.error));
+      this._emitStatus({ up: false, pairRequired: !!r.pairRequired,
+                         hsError: r.error });
+    }
+  }
+
+  /* Handshake complete (or no session in dev mode): the transport is up. */
+  _secured() {
+    this.up = true;
+    this._retry = 0;
+    const q = this._sendQueue; this._sendQueue = [];
+    for (const obj of q) this._dataSend(obj);
+    this._emitStatus({ up: true });
+  }
+
   _ensureCtrl() {
     if (this.ctrlCh !== null || this._ctrlPending) return;
     if (!this._ctrlSend({ type: "open", kind: "ctrl" })) return;
@@ -345,8 +405,11 @@ class RelayTransport {
   }
 
   _dataSend(obj) {
-    if (this.ctrlCh === null || !this.ws || this.ws.readyState !== 1) return false;
-    this.ws.send(dataJsonStr(this.ctrlCh, JSON.stringify(obj), this.codec));
+    if (this.ctrlCh === null || !this.up ||
+        !this.ws || this.ws.readyState !== 1) return false;
+    try {
+      this.ws.send(dataJsonStr(this.ctrlCh, JSON.stringify(obj), this.codec));
+    } catch { return false; }
     return true;
   }
 
@@ -395,13 +458,14 @@ class RelayTransport {
       send(s) {
         if (this.readyState === 1 && this.ch !== null &&
             t.ws && t.ws.readyState === 1) {
-          t.ws.send(dataJsonStr(this.ch, s, t.codec));
+          try { t.ws.send(dataJsonStr(this.ch, s, t.codec)); } catch {}
         }
       },
       close() {
         if (this.readyState === 3) return;
         if (this.ch !== null) {
           t._termSocks.delete(this.ch);
+          t.codec.dropChannel(this.ch);
           t._ctrlSend({ type: "close", ch: this.ch });
         }
         t._termClosed(this);

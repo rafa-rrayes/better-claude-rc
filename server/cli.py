@@ -62,6 +62,24 @@ def _serve(args: argparse.Namespace) -> None:
     uvicorn.run(main_mod.app, host=cfg.host, port=cfg.port, log_level="warning")
 
 
+def _print_pairing(pairing, no_qr: bool) -> None:
+    """The pairing QR: BCRC1.<agent_id>.<b64 agent_pk>.<b64 secret>. The
+    secret exists only in this process's RAM — the relay never sees it."""
+    payload = pairing.qr_payload()
+    print("  Pair your phone: open the app, choose this machine and scan"
+          " the QR\n  (or paste the code).\n")
+    if not no_qr:
+        try:
+            import qrcode
+            qr = qrcode.QRCode(border=1)
+            qr.add_data(payload)
+            qr.make(fit=True)
+            qr.print_ascii(invert=True)
+        except Exception:
+            pass
+    print(f"  Pairing code (valid 10 min, single use):\n  {payload}\n")
+
+
 def _connect(args: argparse.Namespace) -> None:
     """Run the local server (127.0.0.1 unless --lan) + the relay uplink."""
     import asyncio
@@ -71,7 +89,15 @@ def _connect(args: argparse.Namespace) -> None:
     from . import VERSION, proto
     from . import main as main_mod
     from .config import DATA_DIR
-    from .identity import EnrollError, Identity, enroll, platform_http_url
+    from .identity import (
+        Devices,
+        EnrollError,
+        Identity,
+        Pairing,
+        enroll,
+        platform_http_url,
+        secure_dir,
+    )
 
     cfg = main_mod.config
     host = "0.0.0.0" if args.lan else "127.0.0.1"
@@ -82,9 +108,12 @@ def _connect(args: argparse.Namespace) -> None:
         print("No relay URL. Pass --relay wss://… or set BCRC_RELAY_URL.")
         sys.exit(2)
 
-    # Ed25519 identity: generated on this machine, seed never leaves
-    # data/identity.json (0600). The platform stores the public key only.
+    # E2E key material lives in the data dir: 0700 dir, 0600 files, checked
+    # on every startup. The Ed25519 seed never leaves this machine — the
+    # platform stores the public key only.
+    secure_dir(DATA_DIR)
     identity = Identity.load_or_create(DATA_DIR / "identity.json")
+    devices = Devices.load(DATA_DIR / "devices.json")
 
     if args.enroll_token:
         try:
@@ -108,7 +137,6 @@ def _connect(args: argparse.Namespace) -> None:
             print("This machine is not enrolled. Get a command from the "
                   "dashboard:\n  uvx better-claude-rc connect <enroll-token>")
             sys.exit(2)
-        identity = None  # unsigned dev header
 
     print()
     print("  Better Claude RC — connect mode")
@@ -117,15 +145,23 @@ def _connect(args: argparse.Namespace) -> None:
     print(f"  Machine id    {machine_id}")
     print()
 
+    # First run (no paired phones) or --pair: open a 10-minute single-use
+    # pairing window and show the QR. RAM only.
+    pairing = None
+    if len(devices) == 0 or args.pair:
+        pairing = Pairing.generate(machine_id, identity.public_key)
+        _print_pairing(pairing, args.no_qr)
+
     try:
         asyncio.run(_connect_run(main_mod, host, port, relay, machine_id,
-                                 identity))
+                                 identity, devices, pairing))
     except KeyboardInterrupt:
         pass
 
 
-async def _connect_run(main_mod, host: str, port: int,
-                       relay: str, machine_id: str, identity=None) -> None:
+async def _connect_run(main_mod, host: str, port: int, relay: str,
+                       machine_id: str, identity, devices,
+                       pairing=None) -> None:
     import asyncio
     import contextlib
     import os
@@ -147,7 +183,7 @@ async def _connect_run(main_mod, host: str, port: int,
 
     uplink = Uplink(
         main_mod.mgr(), main_mod.terms, main_mod.config, relay, machine_id,
-        identity=identity,
+        identity=identity, devices=devices, pairing=pairing,
         ping_interval=float(os.environ.get("BCRC_PING_INTERVAL", 20)),
         ping_timeout=float(os.environ.get("BCRC_PING_TIMEOUT", 25)),
     )
@@ -194,6 +230,11 @@ def main(argv: list[str] | None = None) -> None:
     p_connect.add_argument("--lan", action="store_true",
                            help="bind the local server to 0.0.0.0 "
                                 "(default: 127.0.0.1)")
+    p_connect.add_argument("--no-qr", action="store_true",
+                           help="print the pairing code as text only")
+    p_connect.add_argument("--pair", action="store_true",
+                           help="open a new 10-minute pairing window "
+                                "(to add another phone)")
     p_connect.set_defaults(func=_connect)
 
     args = parser.parse_args(argv)

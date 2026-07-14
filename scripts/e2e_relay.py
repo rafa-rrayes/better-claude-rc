@@ -1,34 +1,45 @@
 """Relay e2e: in-process platform relay + agent in connect mode + a fake mux
-"browser" client (plaintext NullCodec — M4 swaps in E2ECodec).
+"browser" client running the REAL E2E layer (M4): QR pairing, per-connection
+handshake, secretstream-sealed DATA frames.
 
 Everything flows phone-style THROUGH the relay:
   1. rpc (state, sessions.create) over a ctrl channel
   2. attach → send → streaming events → result (seqs contiguous)
   3. Bash permission request → approve → tool_result
-  4. term channel: term_attach{sid} inside the channel → ANSI output →
+  4. term channel: term_attach{sid} inside the ciphertext → ANSI output →
      typed input echoes back → kill → exit + channel close
   5. frame cap: oversized frame kills the violator with 1009
   6. duplicate agent connect: old uplink kicked with 4409, new accepted
+  7. relay blindness: a frame tap on the relay captured every relayed
+     HS/DATA byte — none of the known plaintext markers (cwd, "attach",
+     session id, prompt/tool text) may appear anywhere in it.
 
 Costs a few haiku turns. Run: uv run python scripts/e2e_relay.py
 """
 
 import asyncio
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# The tap must be configured before app.relay is imported.
+TAP_PATH = Path(tempfile.mkdtemp(prefix="bcrc-tap-")) / "frames.bin"
+os.environ["BCRC_RELAY_TAP"] = str(TAP_PATH)
 
 import uvicorn  # noqa: E402
 import websockets  # noqa: E402
 
 from app import relay as relay_mod  # noqa: E402
 from app.main import app as platform_app  # noqa: E402
-from relay_client import FakeClient  # noqa: E402
+from relay_client import DeviceSim, FakeClient  # noqa: E402
 from server import main as srv  # noqa: E402
 from server import proto  # noqa: E402
 from server.connect import Uplink  # noqa: E402
+from server.identity import Devices, Identity, Pairing  # noqa: E402
 from server.sessions import SessionManager  # noqa: E402
 
 HOST, RPORT = "127.0.0.1", 8806
@@ -87,29 +98,53 @@ async def run_turn(c, ctrl, sid, text):
             return saw
 
 
+def check_relay_blindness(markers: list[bytes]) -> None:
+    """Every relayed HS/DATA byte went through the tap. With the E2E codec
+    in place no protocol plaintext may appear in it."""
+    blob = TAP_PATH.read_bytes()
+    assert len(blob) > 10_000, f"tap suspiciously small ({len(blob)}B)"
+    leaked = [m for m in markers if m in blob]
+    assert not leaked, f"PLAINTEXT LEAKED THROUGH THE RELAY: {leaked}"
+    print(f"S7 PASS — relay tap ({len(blob)} bytes) contains none of "
+          f"{len(markers)} plaintext markers")
+
+
 async def main():
+    # ---- agent-side E2E material (temp dir, like a fresh machine)
+    keydir = Path(tempfile.mkdtemp(prefix="bcrc-e2e-keys-"))
+    identity = Identity.load_or_create(keydir / "identity.json")
+    devices = Devices.load(keydir / "devices.json")
+    pairing = Pairing.generate(MACHINE, identity.public_key)
+    qr = pairing.qr_payload()
+
     relay_server, relay_task = await start_relay()
     m = SessionManager()
     uplink = Uplink(m, srv.terms, srv.config, RELAY, MACHINE,
+                    identity=identity, devices=devices, pairing=pairing,
                     ping_interval=5, ping_timeout=5)
     utask = asyncio.create_task(uplink.run())
 
     # ---- connect the fake browser, wait for the machine to come online
-    c = FakeClient(RELAY, MACHINE)
+    dev = DeviceSim()
+    c = FakeClient(RELAY, MACHINE, device=dev)
     w = await c.connect()
     assert w.get("proto") == proto.PROTO and "plan" in w, w
     await c.wait_status(True, timeout=20)
     print(f"machine online through relay (plan={w['plan']})")
 
-    # ---- ctrl channel: agent pushes hello + sessions, rpc works
+    # ---- ctrl channel: QR pairing + handshake, then hello + sessions + rpc
     ctrl = await c.open("ctrl")
+    await c.handshake(ctrl, pair_qr=qr)
+    assert dev.pinned_agent_pk == identity.public_key, "pin mismatch"
+    assert devices.is_paired(dev.device_pk_b64), "device not persisted"
     hello = await c.wait_type(ctrl, "hello")
     assert hello.get("version"), hello
     first = await c.wait_type(ctrl, "sessions")
     assert isinstance(first.get("sessions"), list), first
     r = await c.rpc(ctrl, "state")
     assert r["ok"] and r["result"]["ok"], r
-    print(f"ctrl channel ok — hello v{hello['version']}, rpc state ok")
+    print(f"ctrl channel ok — paired + E2E handshake, hello "
+          f"v{hello['version']}, rpc state ok")
 
     # ---- create + attach
     r = await c.rpc(ctrl, "sessions.create",
@@ -212,6 +247,17 @@ async def main():
     await c.wait_status(False, timeout=10)  # replacement agent left
     print("S5 PASS — duplicate agent kicked old uplink (4409), new accepted")
 
+    # ---- scenario 6: pairing secret is burned (single use)
+    dev2 = DeviceSim()
+    assert not pairing.active, "pairing secret must be burned after use"
+    try:
+        dev2.load_qr(qr)
+        dev2.pair1()  # mac computes fine, but the agent must refuse
+    except Exception as e:
+        raise AssertionError(f"unexpected: {e}")
+    print("S6 PASS — pairing window closed after single use "
+          "(agent-side refusal exercised in e2e_crypto.py)")
+
     # ---- teardown
     await c.close()
     await v.close()
@@ -222,6 +268,19 @@ async def main():
         pass
     relay_server.should_exit = True
     await relay_task
+
+    # ---- scenario 7: the relay never saw plaintext
+    check_relay_blindness([
+        CWD.encode(),                  # cwd strings
+        b"e2e-playground",
+        sid.encode(),                  # session id
+        b"attach", b"term_attach",     # protocol verbs
+        b"rpc_result", b"sessions.create",
+        b"permission",
+        b"Reply with exactly",         # prompt text
+        b"relay-rc-77",                # tool output
+        b"relayecho",                  # typed terminal input
+    ])
     print("\nRELAY E2E PASS")
 
 

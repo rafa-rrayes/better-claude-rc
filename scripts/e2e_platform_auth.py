@@ -100,11 +100,11 @@ async def run_suite(pg) -> None:
     from app import emailer
     from app import relay as relay_mod
     from app.main import app as platform_app
-    from relay_client import FakeClient
+    from relay_client import DeviceSim, FakeClient
     from server import main as srv
     from server import proto
     from server.connect import Uplink
-    from server.identity import EnrollError, Identity, enroll
+    from server.identity import Devices, EnrollError, Identity, Pairing, enroll
     from server.sessions import SessionManager
 
     server = uvicorn.Server(uvicorn.Config(
@@ -199,8 +199,12 @@ async def run_suite(pg) -> None:
 
     # ---- S3: agent connects with the signed header -> welcome{plan}
     manager = SessionManager()
+    devices1 = Devices.load(scratch / "devices1.json")
+    pairing1 = Pairing.generate(machine_id, ident1.public_key)
+    qr = pairing1.qr_payload()
     uplink = Uplink(manager, srv.terms, srv.config, RELAY, machine_id,
-                    identity=ident1, ping_interval=5, ping_timeout=5)
+                    identity=ident1, devices=devices1, pairing=pairing1,
+                    ping_interval=5, ping_timeout=5)
     utask = asyncio.create_task(uplink.run())
     for _ in range(100):
         if uplink.plan is not None:
@@ -212,11 +216,13 @@ async def run_suite(pg) -> None:
     print("S3 PASS — signed header accepted, welcome{plan=free}, online")
 
     # ---- S4: client WS auth — cookie + ownership; rename API
-    c = FakeClient(RELAY, machine_id, headers=cookie_hdr)
+    c = FakeClient(RELAY, machine_id, headers=cookie_hdr,
+                   device=DeviceSim())
     w = await c.connect()
     assert w.get("plan") == "free", w
     await c.wait_status(True, timeout=10)
     ctrl = await c.open("ctrl")
+    await c.handshake(ctrl, pair_qr=qr)  # M4: pair + E2E handshake
     hello = await c.wait_type(ctrl, "hello")
     assert hello.get("version"), hello
     rr = await c.rpc(ctrl, "state")
