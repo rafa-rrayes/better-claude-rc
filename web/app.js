@@ -349,6 +349,7 @@ function nav(view) {
   closeSheet();
   closeDrawer();
   const hash = view.name === "chat" ? `#/chat/${view.sid}`
+    : view.name === "term" ? `#/term/${view.sid}`
     : view.name === "project" ? `#/project?${encodeURIComponent(view.path)}`
     : `#/${view.name}`;
   if (location.hash !== hash) history.pushState(null, "", hash);
@@ -360,6 +361,7 @@ const LIST_VIEWS = ["sessions", "projects", "skills", "commands", "agents", "mcp
 function routeFromHash() {
   const h = location.hash || "#/home";
   if (h.startsWith("#/chat/")) return { name: "chat", sid: h.slice(7) };
+  if (h.startsWith("#/term/")) return { name: "term", sid: h.slice(7) };
   if (h.startsWith("#/tabs")) return { name: "tabs" };
   if (h.startsWith("#/project?")) return { name: "project", path: decodeURIComponent(h.slice(10)) };
   for (const name of LIST_VIEWS) if (h.startsWith("#/" + name)) return { name };
@@ -404,8 +406,10 @@ function updateConnUI() {
 
 function render() {
   if (!S.authed) { renderLogin(); return; }
+  if (S.view?.name !== "term") disposeTerm();
   switch (S.view?.name) {
     case "chat": renderChat(S.view.sid); break;
+    case "term": renderTerm(S.view.sid); break;
     case "tabs": renderTabs(); break;
     case "project": renderProject(S.view.path); break;
     case "sessions": renderSessions(); break;
@@ -952,6 +956,8 @@ function renderChat(sid) {
         el("div", { class: "crumb", id: "hdr-title" }, s?.title || "session"),
         el("div", { class: "tb-sub", id: "hdr-sub" }, s?.project || ""))),
     el("div", { class: "tb-chips" },
+      el("button", { class: "tb-btn tb-text", "aria-label": "True View (terminal)",
+        onclick: () => openTrueView(sid) }, ">_"),
       tabsBtn(),
       el("button", { class: "tb-btn", onclick: () => infoSheet(sid) }, "ⓘ"))
   );
@@ -1015,6 +1021,7 @@ function handleLocalCommand(sid, text) {
     case "model": modelSheet(sid); return true;
     case "mode": case "permissions": modeSheet(sid); return true;
     case "info": case "context": infoSheet(sid); return true;
+    case "term": case "terminal": case "trueview": openTrueView(sid); return true;
     case "library": case "skills": nav({ name: "skills" }); return true;
   }
   return false;
@@ -1056,6 +1063,183 @@ function updateStatusLine() {
     btn.textContent = showStop ? "■" : "↑";
     btn.className = "c-btn " + (showStop ? "stop" : "send");
   }
+}
+
+// ---------------------------------------------------------------- true view (real claude TUI)
+
+// The server runs `claude --resume <session>` in a PTY and streams raw bytes
+// here; xterm.js renders the actual terminal UI, so this view mirrors Claude
+// Code exactly. The PTY survives leaving the view — reattach replays scrollback.
+
+const termUI = { sid: null, ws: null, term: null, cleanup: null };
+
+const _assets = {};
+function loadAsset(url, kind) {
+  if (!_assets[url]) {
+    _assets[url] = new Promise((resolve, reject) => {
+      const node = kind === "css"
+        ? el("link", { rel: "stylesheet", href: url })
+        : el("script", { src: url });
+      node.onload = resolve;
+      node.onerror = () => { delete _assets[url]; reject(new Error("failed to load " + url)); };
+      document.head.append(node);
+    });
+  }
+  return _assets[url];
+}
+
+function ensureXterm() {
+  return Promise.all([
+    loadAsset("/vendor/xterm/xterm.css", "css"),
+    loadAsset("/vendor/xterm/xterm.js"),
+    loadAsset("/vendor/xterm/addon-fit.js"),
+  ]);
+}
+
+function disposeTerm() {
+  if (termUI.cleanup) termUI.cleanup();
+  if (termUI.ws) { termUI.ws.onclose = null; termUI.ws.onmessage = null; termUI.ws.close(); }
+  if (termUI.term) termUI.term.dispose();
+  termUI.sid = null; termUI.ws = null; termUI.term = null; termUI.cleanup = null;
+}
+
+function openTrueView(sid) {
+  const s = S.sessions.find((x) => x.sid === sid);
+  if (s && !s.claude_session_id) {
+    toast("No Claude session yet — send a message first", true);
+    return;
+  }
+  nav({ name: "term", sid });
+}
+
+const TERM_KEYS = [
+  ["esc", "\u001b"], ["tab", "\t"], ["\u21e7\u21e5", "\u001b[Z"], ["^C", "\u0003"],
+  ["\u2190", "\u001b[D"], ["\u2191", "\u001b[A"], ["\u2193", "\u001b[B"], ["\u2192", "\u001b[C"],
+  ["\u23ce", "\r"],
+];
+
+function termKeyBar() {
+  return el("div", { id: "term-keys" },
+    TERM_KEYS.map(([label, seq]) => el("button", {
+      class: "term-key",
+      // pointerdown + preventDefault: send the key without stealing focus
+      // from xterm (which would close the mobile keyboard)
+      onpointerdown: (e) => {
+        e.preventDefault();
+        if (termUI.ws && termUI.ws.readyState === 1) {
+          termUI.ws.send(JSON.stringify({ type: "input", data: seq }));
+        }
+      },
+    }, label)));
+}
+
+function renderTerm(sid) {
+  disposeTerm();
+  const s = S.sessions.find((x) => x.sid === sid);
+  setTopbar(
+    backBtn({ name: "chat", sid }),
+    el("div", { class: "tb-title" },
+      el("span", { class: "prompt-glyph" }, "❯_"),
+      el("div", { style: "min-width:0" },
+        el("div", { class: "crumb" }, "True View"),
+        el("div", { class: "tb-sub" }, s?.project || ""))),
+    el("div", { class: "tb-chips" },
+      el("button", { class: "tb-btn tb-text", onclick: () => {
+        confirmSheet("End terminal?", "The Claude TUI process stops. The session stays resumable from the chat.", () => {
+          if (termUI.ws && termUI.ws.readyState === 1) termUI.ws.send('{"type":"kill"}');
+        });
+      } }, "end")),
+  );
+
+  const mount = el("div", { id: "term" });
+  const overlay = el("div", { id: "term-overlay", class: "hidden" });
+  $("#view").replaceChildren(el("div", { id: "term-wrap" },
+    el("div", { id: "term-host" }, mount, overlay), termKeyBar()));
+
+  termUI.sid = sid;
+  overlay.classList.remove("hidden");
+  overlay.replaceChildren(el("div", { class: "term-msg" }, "connecting…"));
+  ensureXterm()
+    .then(() => {
+      if (termUI.sid !== sid || S.view?.name !== "term") return;
+      openTerm(sid, mount, overlay);
+    })
+    .catch(() => showTermOverlay(overlay, sid, "Could not load terminal assets"));
+}
+
+function openTerm(sid, mount, overlay) {
+  const term = new Terminal({
+    fontFamily: 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    scrollback: 4000,
+    theme: {
+      background: "#141210", foreground: "#ede6de",
+      cursor: "#e8825e", cursorAccent: "#141210",
+      selectionBackground: "#3a2a22",
+    },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(mount);
+  fit.fit();
+  termUI.term = term;
+
+  const t = localStorage.getItem("bcrc_token");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/term/${sid}`
+    + (t ? `?token=${encodeURIComponent(t)}` : ""));
+  ws.binaryType = "arraybuffer";
+  termUI.ws = ws;
+
+  const sendResize = () => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+  };
+  ws.onopen = () => {
+    overlay.classList.add("hidden");
+    fit.fit(); sendResize(); term.focus();
+  };
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === "exit") showTermOverlay(overlay, sid, msg.reason || "Terminal ended");
+      return;
+    }
+    term.write(new Uint8Array(e.data));
+  };
+  ws.onclose = () => {
+    if (termUI.ws !== ws) return;
+    if (overlay.classList.contains("hidden")) showTermOverlay(overlay, sid, "Disconnected");
+  };
+  term.onData((d) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "input", data: d }));
+  });
+
+  let fitTimer = null;
+  const refit = () => {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => { fit.fit(); sendResize(); }, 120);
+  };
+  window.addEventListener("resize", refit);
+  const vv = window.visualViewport;
+  if (vv) vv.addEventListener("resize", refit);
+  const ping = setInterval(() => { if (ws.readyState === 1) ws.send('{"type":"ping"}'); }, 25000);
+
+  termUI.cleanup = () => {
+    clearTimeout(fitTimer);
+    clearInterval(ping);
+    window.removeEventListener("resize", refit);
+    if (vv) vv.removeEventListener("resize", refit);
+  };
+}
+
+function showTermOverlay(overlay, sid, reason) {
+  overlay.classList.remove("hidden");
+  overlay.replaceChildren(
+    el("div", { class: "term-msg" }, reason),
+    el("div", { class: "term-actions" },
+      el("button", { onclick: () => renderTerm(sid) }, "reopen"),
+      el("button", { onclick: () => nav({ name: "chat", sid }) }, "back to chat")));
 }
 
 // ---------------------------------------------------------------- transcript rendering

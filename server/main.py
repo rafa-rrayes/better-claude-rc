@@ -23,13 +23,15 @@ from fastapi.staticfiles import StaticFiles
 
 from . import library, projects
 from .config import Config
-from .sessions import MODEL_CHOICES, PERMISSION_MODES, SessionManager
+from .sessions import BUSY_STATES, MODEL_CHOICES, PERMISSION_MODES, SessionManager
+from .terminal import TerminalError, TerminalManager, claude_argv
 
 VERSION = "0.1.0"
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 config = Config.load()
 manager: SessionManager | None = None
+terms = TerminalManager()
 
 
 @asynccontextmanager
@@ -37,6 +39,7 @@ async def lifespan(app: FastAPI):
     global manager
     manager = SessionManager()
     yield
+    terms.close_all()
     await manager.shutdown()
 
 
@@ -271,6 +274,11 @@ async def handle_ws(m: SessionManager, conn: WSConn, msg: dict) -> None:
         conn.push({"type": "error", "message": "no such session", "ref": sid})
         return
 
+    if mtype in ("send", "compact", "clear"):
+        # The chat is taking the session back — a live True View terminal
+        # would be left behind the transcript, so close it first.
+        terms.close(sid, "Continued from the app")
+
     if mtype == "send":
         asyncio.create_task(_safe(runner.send(msg.get("text", "")), runner))
     elif mtype == "interrupt":
@@ -298,6 +306,93 @@ async def _safe(coro, runner) -> None:
     except Exception as e:
         with contextlib.suppress(Exception):
             runner.notice(f"Action failed: {e}", "error")
+
+
+# ---------------- true view (real claude TUI over a PTY) ----------------
+
+@app.websocket("/ws/term/{sid}")
+async def ws_terminal(ws: WebSocket, sid: str):
+    """Attach an xterm.js client to the session's PTY terminal, spawning
+    `claude --resume <claude_id>` on first attach. Server→client: binary
+    frames are raw terminal output; text frames are JSON control messages
+    ({"type": "exit"|"pong"}). Client→server: JSON text frames
+    ({"type": "input"|"resize"|"ping"|"kill"})."""
+    token = ws.cookies.get(COOKIE) or ws.query_params.get("token")
+    if not _token_ok(token):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+
+    async def bail(reason: str) -> None:
+        await ws.send_json({"type": "exit", "reason": reason})
+        await ws.close()
+
+    runner = mgr().get(sid)
+    if runner is None:
+        await bail("No such session")
+        return
+    if not runner.claude_ids:
+        await bail("No Claude session yet — send a message first")
+        return
+    if runner.client is not None and runner.state in BUSY_STATES:
+        await bail("Session is busy in the app — wait for the turn to finish")
+        return
+    if runner.client is not None:
+        await runner.detach_for_terminal()
+    term = terms.get(sid)
+    if term is None:
+        try:
+            argv = claude_argv(runner.claude_ids[-1], runner.model, runner.mode)
+            term = terms.open(sid, argv, runner.cwd)
+        except (TerminalError, OSError) as e:
+            await bail(f"Could not start terminal: {e}")
+            return
+
+    q: asyncio.Queue = asyncio.Queue()
+    replay = term.attach(q)
+
+    async def pump() -> None:
+        if replay:
+            await ws.send_bytes(replay)
+        while True:
+            item = await q.get()
+            if isinstance(item, dict):
+                await ws.send_json(item)
+                if item.get("type") == "exit":
+                    await ws.close()
+                    return
+            else:
+                await ws.send_bytes(item)
+
+    sender = asyncio.create_task(pump())
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            text = msg.get("text")
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            dtype = data.get("type")
+            if dtype == "input":
+                term.write(str(data.get("data", "")).encode())
+            elif dtype == "resize":
+                term.resize(int(data.get("cols") or 0), int(data.get("rows") or 0))
+            elif dtype == "ping":
+                q.put_nowait({"type": "pong"})
+            elif dtype == "kill":
+                terms.close(sid, "Terminal ended")
+    except WebSocketDisconnect:
+        pass
+    finally:
+        term.detach(q)
+        sender.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender
 
 
 # ---------------- static frontend ----------------
