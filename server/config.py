@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import socket
 import subprocess
@@ -10,7 +11,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+
+
+def _data_dir() -> Path:
+    """data/ next to the repo when running from a source checkout;
+    ~/.better-claude-rc when running from an installed wheel (uvx).
+    BCRC_DATA_DIR overrides both."""
+    env = os.environ.get("BCRC_DATA_DIR")
+    if env:
+        return Path(env).expanduser()
+    if (ROOT / "pyproject.toml").exists():
+        return ROOT / "data"
+    return Path.home() / ".better-claude-rc"
+
+
+DATA_DIR = _data_dir()
 SESSIONS_DIR = DATA_DIR / "sessions"
 CONFIG_PATH = DATA_DIR / "config.json"
 

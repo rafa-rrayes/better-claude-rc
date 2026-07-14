@@ -27,7 +27,7 @@ from .sessions import BUSY_STATES, MODEL_CHOICES, PERMISSION_MODES, SessionManag
 from .terminal import TerminalError, TerminalManager, claude_argv
 
 VERSION = "0.1.0"
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+WEB_DIR = Path(__file__).resolve().parent / "web"
 
 config = Config.load()
 manager: SessionManager | None = None
