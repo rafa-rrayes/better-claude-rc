@@ -127,6 +127,10 @@ function md(src) {
 
 const S = {
   authed: false,
+  mode: null,          // "local" | "platform" (GET /api/env at boot)
+  email: null,         // platform: signed-in account
+  plan: null,          // platform: subscription plan from /api/me
+  machines: [],        // platform: enrolled machines
   view: null,          // {name, ...params}
   sessions: [],
   tabs: [],            // sids open as tabs (insertion order)
@@ -232,6 +236,7 @@ function onTransportStatus(st) {
   updateConnUI();
   if (st.authRequired) { S.authed = false; nav({ name: "login" }); return; }
   if (st.up) {
+    if (S.mode === "platform" && !S._stateLoaded) { finishBoot(); }
     for (const sid of S.subs) {
       T.send({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
     }
@@ -434,6 +439,12 @@ function openDrawer() {
         el("span", { class: "n-count" }, String(navCount(t.name) || ""))))),
     el("div", { class: "drawer-foot" },
       el("span", { class: S.wsUp ? "conn-ok" : "conn-bad" }, S.wsUp ? "● connected" : "○ offline"),
+      S.mode === "platform"
+        ? el("button", { class: "foot-btn", onclick: () => {
+            closeDrawer();
+            refreshMachines().finally(() => renderMachinePicker());
+          } }, "machines")
+        : null,
       el("button", { class: "foot-btn", onclick: doLogout }, "log out"))));
   $("#drawer-root").append(backdrop);
   loadLibrary().then(() => {
@@ -449,11 +460,15 @@ function openDrawer() {
 function closeDrawer() { $("#drawer-root").replaceChildren(); }
 
 async function doLogout() {
-  try { await api("/api/logout", { method: "POST" }); } catch {}
+  const path = S.mode === "platform" ? "/api/auth/logout" : "/api/logout";
+  try { await api(path, { method: "POST" }); } catch {}
   localStorage.removeItem("bcrc_token"); // legacy cleanup
+  localStorage.removeItem("bcrc_machine");
   S.authed = false;
+  S._stateLoaded = false;
   closeDrawer(); closeSheet();
   try { T?.close(); } catch {}
+  T = null;
   renderLogin();
 }
 
@@ -508,6 +523,7 @@ const shortPath = (p) => (p || "").replace(S.home, "~");
 // ---------------------------------------------------------------- login
 
 function renderLogin() {
+  if (S.mode === "platform") { renderPlatformLogin(); return; }
   setTopbar();
   $("#view").replaceChildren(
     el("div", { class: "login-box" },
@@ -520,6 +536,111 @@ function renderLogin() {
       el("div", { class: "login-err", id: "login-err" })
     )
   );
+}
+
+// -------- platform login (magic link by email) --------
+
+function renderPlatformLogin(sentTo) {
+  setTopbar();
+  $("#view").replaceChildren(
+    el("div", { class: "login-box" },
+      el("div", { class: "glyph" }, "❯_"),
+      el("h1", null, "Claude RC"),
+      sentTo
+        ? el("p", null, `Check ${sentTo} for a sign-in link. It works for 15 minutes.`)
+        : el("p", null, "Sign in with your email — we'll send you a magic link."),
+      sentTo ? null : el("input", { type: "email", placeholder: "you@example.com", id: "email",
+        autocapitalize: "none", autocorrect: "off", autocomplete: "email" }),
+      sentTo
+        ? el("button", { class: "btn", onclick: () => renderPlatformLogin() }, "Use a different email")
+        : el("button", { class: "btn primary", onclick: requestMagicLink }, "Email me a link"),
+      el("div", { class: "login-err", id: "login-err" })
+    )
+  );
+}
+
+async function requestMagicLink() {
+  const email = $("#email").value.trim();
+  if (!email || !email.includes("@")) {
+    $("#login-err").textContent = "Enter a valid email address";
+    return;
+  }
+  try {
+    await api("/api/auth/request-link", {
+      method: "POST", body: JSON.stringify({ email }),
+    });
+    renderPlatformLogin(email);
+  } catch (e) {
+    $("#login-err").textContent = e.message || "Could not send the link";
+  }
+}
+
+// -------- platform machine picker --------
+
+function renderMachinePicker() {
+  setTopbar();
+  const view = $("#view");
+  const box = el("div", { class: "pad machines" },
+    el("h2", { class: "home-h" }, "Your Machines"));
+  const machines = S.machines || [];
+  if (!machines.length) {
+    box.append(
+      el("div", { class: "card home-empty" },
+        "No machines yet. Run this on the computer you want to control:"),
+      el("div", { class: "enroll-box", id: "enroll-box" },
+        el("button", { class: "btn primary", onclick: showEnrollCommand },
+          "Generate enroll command")));
+  } else {
+    box.append(el("div", { class: "vs-list" }, machines.map((m) => bigItem({
+      icon: m.online ? "●" : "○",
+      title: m.name || m.id.slice(0, 8),
+      sub: m.online ? "online"
+        : m.last_seen_at ? "last seen " + relTime(Date.parse(m.last_seen_at))
+        : "never connected",
+      onclick: () => connectMachine(m.id),
+    }))));
+    box.append(el("div", { class: "enroll-box", id: "enroll-box" },
+      el("button", { class: "btn small", onclick: showEnrollCommand },
+        "+ Add a machine")));
+  }
+  box.append(el("div", { class: "a-buttons", style: "margin-top:18px" },
+    el("button", { class: "btn small", onclick: refreshMachines }, "Refresh"),
+    el("button", { class: "btn small", onclick: doLogout }, "Log out")));
+  view.replaceChildren(box);
+}
+
+async function refreshMachines() {
+  try {
+    S.machines = (await api("/api/machines")).machines || [];
+    renderMachinePicker();
+  } catch {}
+}
+
+async function showEnrollCommand() {
+  try {
+    const r = await api("/api/machines/enroll-token", { method: "POST" });
+    const boxEl = $("#enroll-box");
+    if (!boxEl) return;
+    boxEl.replaceChildren(
+      el("div", { class: "enroll-cmd" }, r.command),
+      el("div", { class: "notice" },
+        "Run it in a terminal on that computer (valid 10 minutes), then hit Refresh."),
+      el("button", { class: "btn small", onclick: () => {
+        navigator.clipboard?.writeText(r.command).then(() => toast("Copied"));
+      } }, "Copy command"));
+  } catch (e) {
+    toast(e.message || "Could not create an enroll token", true);
+  }
+}
+
+function connectMachine(mid) {
+  localStorage.setItem("bcrc_machine", mid);
+  if (T) { try { T.close(); } catch {} }
+  T = new RelayTransport(mid);
+  T.onMessage(handleWS);
+  T.onStatus(onTransportStatus);
+  T.connect();
+  finishBoot();
 }
 
 async function doLogin() {
@@ -1851,8 +1972,11 @@ if (window.visualViewport) {
 // ---------------------------------------------------------------- boot
 
 async function boot() {
+  if (!S.mode) S.mode = await fetchEnvMode(); // transport.js; GET /api/env
+  if (S.mode === "platform") { await bootPlatform(); return; }
+
   if (!T) {
-    T = await makeTransport(); // transport.js; GET /api/env picks the mode
+    T = new LocalTransport();
     T.onMessage(handleWS);
     T.onStatus(onTransportStatus);
   }
@@ -1869,9 +1993,50 @@ async function boot() {
     } catch {}
   }
 
+  await finishBoot();
+}
+
+async function bootPlatform() {
+  // magic-link token arrives in the URL fragment — never a query string
+  const mAuth = (location.hash || "").match(/^#auth=([A-Za-z0-9_-]+)$/);
+  if (mAuth) {
+    history.replaceState(null, "", location.pathname);
+    try {
+      await api("/api/auth/redeem", {
+        method: "POST", body: JSON.stringify({ token: mAuth[1] }),
+      });
+    } catch {}
+  }
+
+  let me;
+  try {
+    me = await api("/api/me");
+  } catch {
+    S.authed = false;
+    renderLogin();
+    return;
+  }
+  S.authed = true;
+  S.email = me.email;
+  S.plan = me.plan;
+  try {
+    S.machines = (await api("/api/machines")).machines || [];
+  } catch {
+    S.machines = [];
+  }
+
+  let mid = localStorage.getItem("bcrc_machine");
+  if (!S.machines.some((m) => m.id === mid)) mid = null;
+  if (!mid && S.machines.length === 1) mid = S.machines[0].id; // auto-skip
+  if (!mid) { renderMachinePicker(); return; }
+  connectMachine(mid);
+}
+
+async function finishBoot() {
   try {
     const state = await T.rpc("state");
     S.authed = true;
+    S._stateLoaded = true;
     S.sessions = state.sessions;
     S.defaults = state.defaults;
     S.home = state.home;
@@ -1883,6 +2048,13 @@ async function boot() {
     S.view = routeFromHash();
     render();
   } catch {
+    if (S.mode === "platform") {
+      // the machine is offline or still connecting: show the app shell with
+      // the offline pill; events flow in once machine_status goes online
+      S.view = routeFromHash();
+      render();
+      return;
+    }
     S.authed = false;
     renderLogin();
   }

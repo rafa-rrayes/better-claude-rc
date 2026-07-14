@@ -724,3 +724,14 @@ a { color: var(--accent); }
   padding: 7px 13px; flex: none; line-height: 1;
 }
 .term-key:active { color: #e8825e; border-color: #e8825e; }
+
+/* ------------------------------------------------ platform: machine picker */
+.machines { max-width: 520px; margin: 0 auto; }
+.enroll-box { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.enroll-cmd {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  padding: 12px 14px; border-radius: 10px; word-break: break-all;
+  user-select: all; -webkit-user-select: all;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--accent);
+}

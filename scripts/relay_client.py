@@ -17,9 +17,11 @@ from server.codec import NullCodec
 
 
 class FakeClient:
-    def __init__(self, relay_url: str, machine: str, codec=None):
+    def __init__(self, relay_url: str, machine: str, codec=None,
+                 headers: dict | None = None):
         self.url = relay_url.rstrip("/") + f"/client/ws?machine={machine}"
         self.codec = codec or NullCodec()
+        self.headers = headers or {}
         self.ws = None
         self.close_code: int | None = None
         self._ctrl_buf: list[dict] = []
@@ -38,7 +40,8 @@ class FakeClient:
         while True:
             try:
                 self.ws = await websockets.connect(
-                    self.url, max_size=proto.FRAME_MAX_WIRE)
+                    self.url, max_size=proto.FRAME_MAX_WIRE,
+                    additional_headers=self.headers)
                 break
             except OSError:
                 if loop.time() > deadline:

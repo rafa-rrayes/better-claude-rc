@@ -50,9 +50,13 @@ KICK_MIN_BACKOFF = 30.0  # after a 4409 duplicate-agent kick
 _FATAL_UNAUTHORIZED = (proto.CLOSE_UNAUTHORIZED, proto.CLOSE_FORBIDDEN)
 
 
-def agent_auth_header(machine_id: str) -> str:
-    """M2 STUB: bare machine id. M3 replaces this with the signed header
-    X-BCRC-Agent: <agent_id>.<ts>.<Ed25519 sig over method|path|ts>."""
+def agent_auth_header(machine_id: str, identity=None) -> str:
+    """Signed header X-BCRC-Agent: <agent_id>.<ts>.<Ed25519 sig over
+    method|path|ts> (server/identity.py). Without an identity (DB-less dev
+    relay, loopback e2e) it degrades to the bare machine id, which a
+    production relay refuses."""
+    if identity is not None:
+        return identity.auth_header("GET", "/agent/ws")
     return machine_id
 
 
@@ -166,8 +170,8 @@ class ClientState:
 class Uplink:
     def __init__(self, manager: SessionManager, terms: TerminalManager,
                  config: Config, relay_url: str, machine_id: str, *,
-                 codec_factory=NullCodec, ping_interval: float = 20.0,
-                 ping_timeout: float = 25.0,
+                 identity=None, codec_factory=NullCodec,
+                 ping_interval: float = 20.0, ping_timeout: float = 25.0,
                  backoff_base: float = BACKOFF_BASE,
                  backoff_cap: float = BACKOFF_CAP):
         self.manager = manager
@@ -175,6 +179,7 @@ class Uplink:
         self.config = config
         self.relay_url = relay_url.rstrip("/")
         self.machine_id = machine_id
+        self.identity = identity
         self.codec_factory = codec_factory
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
@@ -225,7 +230,8 @@ class Uplink:
 
     async def _session(self) -> None:
         url = self.relay_url + "/agent/ws"
-        headers = {"X-BCRC-Agent": agent_auth_header(self.machine_id)}
+        headers = {"X-BCRC-Agent": agent_auth_header(self.machine_id,
+                                                     self.identity)}
         async with websockets.connect(
                 url, additional_headers=headers,
                 ping_interval=self.ping_interval,

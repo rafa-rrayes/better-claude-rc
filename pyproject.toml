@@ -9,6 +9,7 @@ requires-python = ">=3.14"
 dependencies = [
     "claude-agent-sdk>=0.2.111",
     "fastapi>=0.139.0",
+    "pynacl>=1.6.2",
     "qrcode>=8.2",
     "uvicorn[standard]>=0.50.2",
     "websockets>=16.0",
@@ -38,4 +39,5 @@ bcrc-platform = { workspace = true }
 [dependency-groups]
 dev = [
     "bcrc-platform",
+    "httpx>=0.28.1",
 ]

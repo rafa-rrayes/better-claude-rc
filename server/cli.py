@@ -66,9 +66,12 @@ def _connect(args: argparse.Namespace) -> None:
     """Run the local server (127.0.0.1 unless --lan) + the relay uplink."""
     import asyncio
     import os
-    import uuid
+    import socket
 
+    from . import VERSION, proto
     from . import main as main_mod
+    from .config import DATA_DIR
+    from .identity import EnrollError, Identity, enroll, platform_http_url
 
     cfg = main_mod.config
     host = "0.0.0.0" if args.lan else "127.0.0.1"
@@ -78,15 +81,34 @@ def _connect(args: argparse.Namespace) -> None:
     if not relay:
         print("No relay URL. Pass --relay wss://… or set BCRC_RELAY_URL.")
         sys.exit(2)
-    machine_id = os.environ.get("BCRC_MACHINE_ID") or cfg.extra.get("machine_id")
-    if not machine_id:
-        machine_id = uuid.uuid4().hex
-        cfg.extra["machine_id"] = machine_id
-        cfg.save()
+
+    # Ed25519 identity: generated on this machine, seed never leaves
+    # data/identity.json (0600). The platform stores the public key only.
+    identity = Identity.load_or_create(DATA_DIR / "identity.json")
+
     if args.enroll_token:
-        # Enrollment (Ed25519 identity + machine registry) lands in M3; the
-        # token is accepted now so the one-liner is stable.
-        print("(enrollment not yet available — connecting with a stub identity)")
+        try:
+            identity.machine_id = enroll(
+                platform_http_url(relay), args.enroll_token, identity,
+                name=socket.gethostname(), agent_version=VERSION,
+                proto=proto.PROTO)
+        except EnrollError as e:
+            print(f"[bcrc] {e}")
+            sys.exit(1)
+        identity.save()
+        print(f"[bcrc] machine enrolled — id {identity.machine_id}")
+
+    machine_id = identity.machine_id
+    if not machine_id:
+        # Dev fallback (relay without a database): a locally-chosen id. A
+        # production relay refuses it — run `connect <enroll-token>` first.
+        machine_id = (os.environ.get("BCRC_MACHINE_ID")
+                      or cfg.extra.get("machine_id"))
+        if not machine_id:
+            print("This machine is not enrolled. Get a command from the "
+                  "dashboard:\n  uvx better-claude-rc connect <enroll-token>")
+            sys.exit(2)
+        identity = None  # unsigned dev header
 
     print()
     print("  Better Claude RC — connect mode")
@@ -96,13 +118,14 @@ def _connect(args: argparse.Namespace) -> None:
     print()
 
     try:
-        asyncio.run(_connect_run(main_mod, host, port, relay, machine_id))
+        asyncio.run(_connect_run(main_mod, host, port, relay, machine_id,
+                                 identity))
     except KeyboardInterrupt:
         pass
 
 
 async def _connect_run(main_mod, host: str, port: int,
-                       relay: str, machine_id: str) -> None:
+                       relay: str, machine_id: str, identity=None) -> None:
     import asyncio
     import contextlib
     import os
@@ -124,6 +147,7 @@ async def _connect_run(main_mod, host: str, port: int,
 
     uplink = Uplink(
         main_mod.mgr(), main_mod.terms, main_mod.config, relay, machine_id,
+        identity=identity,
         ping_interval=float(os.environ.get("BCRC_PING_INTERVAL", 20)),
         ping_timeout=float(os.environ.get("BCRC_PING_TIMEOUT", 25)),
     )
