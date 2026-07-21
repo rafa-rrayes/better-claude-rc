@@ -118,7 +118,7 @@ def browse(path: str | None, root: str) -> dict:
     """List sub-directories for the new-session folder picker."""
     root_p = Path(root).resolve()
     p = Path(path).expanduser().resolve() if path else root_p
-    if not str(p).startswith(str(root_p)):
+    if not p.is_relative_to(root_p):
         p = root_p
     if not p.is_dir():
         p = root_p
@@ -137,6 +137,6 @@ def browse(path: str | None, root: str) -> dict:
         pass
     return {
         "path": str(p),
-        "parent": str(p.parent) if p != root_p and str(p.parent).startswith(str(root_p)) else None,
+        "parent": str(p.parent) if p != root_p and p.parent.is_relative_to(root_p) else None,
         "dirs": dirs,
     }

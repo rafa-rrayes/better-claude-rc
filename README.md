@@ -82,6 +82,35 @@ uv run python -m server --host 127.0.0.1   # bind localhost only (see Security)
   you can use the app securely from anywhere — no port forwarding, no exposing
   anything to the public internet.
 - **LAN fallback.** On the same Wi-Fi, the printed LAN URL works directly.
+- **Hosted platform.** No Tailscale, no network setup — see below.
+
+## Hosted platform
+
+[bcrc.rrayes.com.br](https://bcrc.rrayes.com.br) is the hosted way to reach
+your Mac from anywhere, on cellular, with nothing to configure:
+
+1. **Sign up** with your email (magic link, no password).
+2. **Enroll your Mac** — the dashboard gives you a one-line command:
+   ```bash
+   curl -fsSL https://<platform>/i/bcrc_enr_… | bash
+   ```
+   It installs [uv](https://docs.astral.sh/uv/) if needed, installs the agent
+   from the platform's self-hosted wheel (no PyPI), and connects.
+3. **Scan the QR** the agent prints with your phone. That pairing is the
+   encryption root: keys live only on your phone and your Mac.
+4. **Drive sessions** from the PWA — live sessions, terminals, permission
+   prompts, history — exactly like local mode.
+
+The relay is **end-to-end encrypted and blind by design**: after the QR
+pairing, every frame between phone and Mac is sealed with keys the platform
+never sees (libsodium secretstream). The server routes opaque ciphertext and
+can enforce quotas — it cannot read prompts, code, or output. Local mode
+stays fully supported and unchanged; the hosted platform is optional.
+
+> iOS papercut: an installed (home-screen) app keeps a cookie jar separate
+> from Safari, and sign-in links from Mail open in Safari. Easiest order:
+> sign in inside Safari first, **then** Share → Add to Home Screen — the
+> installed app inherits the signed-in session at install time.
 
 ## Security model
 

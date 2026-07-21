@@ -127,6 +127,10 @@ function md(src) {
 
 const S = {
   authed: false,
+  mode: null,          // "local" | "platform" (GET /api/env at boot)
+  email: null,         // platform: signed-in account
+  plan: null,          // platform: subscription plan from /api/me
+  machines: [],        // platform: enrolled machines
   view: null,          // {name, ...params}
   sessions: [],
   tabs: [],            // sids open as tabs (insertion order)
@@ -137,7 +141,6 @@ const S = {
   status: {},          // sid -> {state, detail}
   context: {},         // sid -> context usage
   subs: new Set(),
-  ws: null,
   wsUp: false,
   defaults: { models: ["default", "opus", "sonnet", "haiku"], modes: ["default", "acceptEdits", "plan"] },
   home: "",
@@ -151,7 +154,7 @@ let _libPromise = null;
 function loadLibrary() {
   if (S.library && Date.now() - S.libraryAt < 15000) return Promise.resolve(S.library);
   if (!_libPromise) {
-    _libPromise = api("/api/library")
+    _libPromise = T.rpc("library")
       .then((lib) => { S.library = lib; S.libraryAt = Date.now(); return lib; })
       .finally(() => { _libPromise = null; });
   }
@@ -162,7 +165,7 @@ let _projPromise = null;
 function loadProjects() {
   if (S.projects && Date.now() - S.projectsAt < 30000) return Promise.resolve(S.projects);
   if (!_projPromise) {
-    _projPromise = api("/api/projects")
+    _projPromise = T.rpc("projects.recent")
       .then(({ projects }) => { S.projects = projects; S.projectsAt = Date.now(); return projects; })
       .finally(() => { _projPromise = null; });
   }
@@ -201,16 +204,13 @@ function closeTab(sid) {
 loadTabs();
 
 // ---------------------------------------------------------------- api
-
-function authHeaders() {
-  const t = localStorage.getItem("bcrc_token");
-  return t ? { Authorization: "Bearer " + t } : {};
-}
+// REST is only used for auth (/api/login, /api/logout) and /api/env.
+// Everything else rides the transport as rpc over the control channel.
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     ...opts,
-    headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
   });
   if (res.status === 401) { S.authed = false; nav({ name: "login" }); throw new Error("unauthorized"); }
   if (!res.ok) {
@@ -221,47 +221,38 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-// ---------------------------------------------------------------- websocket
+// ---------------------------------------------------------------- transport
 
-let wsRetry = 0;
-
-function wsConnect() {
-  if (S.ws && (S.ws.readyState === 0 || S.ws.readyState === 1)) return;
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const t = localStorage.getItem("bcrc_token");
-  const url = `${proto}://${location.host}/ws` + (t ? `?token=${encodeURIComponent(t)}` : "");
-  const ws = new WebSocket(url);
-  S.ws = ws;
-
-  ws.onopen = () => {
-    S.wsUp = true; wsRetry = 0;
-    updateConnUI();
-    for (const sid of S.subs) {
-      ws.send(JSON.stringify({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 }));
-    }
-  };
-  ws.onmessage = (e) => {
-    let msg; try { msg = JSON.parse(e.data); } catch { return; }
-    handleWS(msg);
-  };
-  ws.onclose = (e) => {
-    S.wsUp = false; updateConnUI();
-    if (e.code === 4401) { S.authed = false; nav({ name: "login" }); return; }
-    setTimeout(wsConnect, Math.min(8000, 500 * 2 ** wsRetry++));
-  };
-  ws.onerror = () => ws.close();
-}
+let T = null; // set during boot (LocalTransport for now; see transport.js)
 
 function wsSend(obj) {
-  if (S.ws && S.ws.readyState === 1) { S.ws.send(JSON.stringify(obj)); return true; }
+  if (T && T.send(obj)) return true;
   toast("Not connected — retrying…", true);
-  wsConnect();
   return false;
 }
 
-setInterval(() => { if (S.ws && S.ws.readyState === 1) S.ws.send('{"type":"ping"}'); }, 25000);
+function onTransportStatus(st) {
+  S.wsUp = !!st.up;
+  updateConnUI();
+  if (st.authRequired) { S.authed = false; nav({ name: "login" }); return; }
+  if (st.pairRequired) {
+    // the agent no longer trusts this device (revoked / never paired)
+    const mid = localStorage.getItem("bcrc_machine");
+    try { T?.close(); } catch {}
+    T = null;
+    if (mid) renderPairScreen(mid);
+    return;
+  }
+  if (st.up) {
+    if (S.mode === "platform" && !S._stateLoaded) { finishBoot(); }
+    for (const sid of S.subs) {
+      T.send({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
+    }
+  }
+}
+
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && S.authed) wsConnect();
+  if (!document.hidden && S.authed && T) T.connect();
 });
 
 function handleWS(msg) {
@@ -335,11 +326,9 @@ function applyEventToState(sid, ev) {
 function subscribe(sid) {
   if (S.subs.has(sid)) return;
   S.subs.add(sid);
-  if (S.ws && S.ws.readyState === 1) {
-    wsSend({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
-  } else {
-    wsConnect();
-  }
+  // if the socket is down, T.send reconnects and onTransportStatus
+  // re-attaches every S.subs entry once it is up again
+  if (T) T.send({ type: "attach", session_id: sid, since_seq: S.seqs[sid] || 0 });
 }
 
 // ---------------------------------------------------------------- router
@@ -349,6 +338,7 @@ function nav(view) {
   closeSheet();
   closeDrawer();
   const hash = view.name === "chat" ? `#/chat/${view.sid}`
+    : view.name === "term" ? `#/term/${view.sid}`
     : view.name === "project" ? `#/project?${encodeURIComponent(view.path)}`
     : `#/${view.name}`;
   if (location.hash !== hash) history.pushState(null, "", hash);
@@ -360,6 +350,7 @@ const LIST_VIEWS = ["sessions", "projects", "skills", "commands", "agents", "mcp
 function routeFromHash() {
   const h = location.hash || "#/home";
   if (h.startsWith("#/chat/")) return { name: "chat", sid: h.slice(7) };
+  if (h.startsWith("#/term/")) return { name: "term", sid: h.slice(7) };
   if (h.startsWith("#/tabs")) return { name: "tabs" };
   if (h.startsWith("#/project?")) return { name: "project", path: decodeURIComponent(h.slice(10)) };
   for (const name of LIST_VIEWS) if (h.startsWith("#/" + name)) return { name };
@@ -404,8 +395,10 @@ function updateConnUI() {
 
 function render() {
   if (!S.authed) { renderLogin(); return; }
+  if (S.view?.name !== "term") disposeTerm();
   switch (S.view?.name) {
     case "chat": renderChat(S.view.sid); break;
+    case "term": renderTerm(S.view.sid); break;
     case "tabs": renderTabs(); break;
     case "project": renderProject(S.view.path); break;
     case "sessions": renderSessions(); break;
@@ -454,6 +447,24 @@ function openDrawer() {
         el("span", { class: "n-count" }, String(navCount(t.name) || ""))))),
     el("div", { class: "drawer-foot" },
       el("span", { class: S.wsUp ? "conn-ok" : "conn-bad" }, S.wsUp ? "● connected" : "○ offline"),
+      S.mode === "platform"
+        ? el("button", { class: "foot-btn", onclick: () => {
+            closeDrawer();
+            refreshMachines().finally(() => renderMachinePicker());
+          } }, "machines")
+        : null,
+      S.mode === "platform"
+        ? el("button", { class: "foot-btn", onclick: () => {
+            closeDrawer();
+            renderDevicesScreen();
+          } }, "devices")
+        : null,
+      S.mode === "platform"
+        ? el("button", { class: "foot-btn", onclick: () => {
+            closeDrawer();
+            renderBillingScreen();
+          } }, "billing")
+        : null,
       el("button", { class: "foot-btn", onclick: doLogout }, "log out"))));
   $("#drawer-root").append(backdrop);
   loadLibrary().then(() => {
@@ -469,11 +480,15 @@ function openDrawer() {
 function closeDrawer() { $("#drawer-root").replaceChildren(); }
 
 async function doLogout() {
-  try { await api("/api/logout", { method: "POST" }); } catch {}
-  localStorage.removeItem("bcrc_token");
+  const path = S.mode === "platform" ? "/api/auth/logout" : "/api/logout";
+  try { await api(path, { method: "POST" }); } catch {}
+  localStorage.removeItem("bcrc_token"); // legacy cleanup
+  localStorage.removeItem("bcrc_machine");
   S.authed = false;
+  S._stateLoaded = false;
   closeDrawer(); closeSheet();
-  try { S.ws?.close(); } catch {}
+  try { T?.close(); } catch {}
+  T = null;
   renderLogin();
 }
 
@@ -528,6 +543,7 @@ const shortPath = (p) => (p || "").replace(S.home, "~");
 // ---------------------------------------------------------------- login
 
 function renderLogin() {
+  if (S.mode === "platform") { renderPlatformLogin(); return; }
   setTopbar();
   $("#view").replaceChildren(
     el("div", { class: "login-box" },
@@ -542,6 +558,338 @@ function renderLogin() {
   );
 }
 
+// -------- platform login (magic link by email) --------
+
+function renderPlatformLogin(sentTo) {
+  setTopbar();
+  $("#view").replaceChildren(
+    el("div", { class: "login-box" },
+      el("div", { class: "glyph" }, "❯_"),
+      el("h1", null, "Claude RC"),
+      sentTo
+        ? el("p", null, `Check ${sentTo} for a sign-in link. It works for 15 minutes.`)
+        : el("p", null, "Sign in with your email — we'll send you a magic link."),
+      sentTo ? null : el("input", { type: "email", placeholder: "you@example.com", id: "email",
+        autocapitalize: "none", autocorrect: "off", autocomplete: "email" }),
+      sentTo
+        ? el("button", { class: "btn", onclick: () => renderPlatformLogin() }, "Use a different email")
+        : el("button", { class: "btn primary", onclick: requestMagicLink }, "Email me a link"),
+      el("div", { class: "login-err", id: "login-err" })
+    )
+  );
+}
+
+async function requestMagicLink() {
+  const email = $("#email").value.trim();
+  if (!email || !email.includes("@")) {
+    $("#login-err").textContent = "Enter a valid email address";
+    return;
+  }
+  try {
+    await api("/api/auth/request-link", {
+      method: "POST", body: JSON.stringify({ email }),
+    });
+    renderPlatformLogin(email);
+  } catch (e) {
+    $("#login-err").textContent = e.message || "Could not send the link";
+  }
+}
+
+// -------- platform machine picker --------
+
+function renderMachinePicker() {
+  setTopbar();
+  const view = $("#view");
+  const box = el("div", { class: "pad machines" },
+    el("h2", { class: "home-h" }, "Your Machines"));
+  const machines = S.machines || [];
+  if (!machines.length) {
+    box.append(
+      el("div", { class: "card home-empty" },
+        "No machines yet. Run this on the computer you want to control:"),
+      el("div", { class: "enroll-box", id: "enroll-box" },
+        el("button", { class: "btn primary", onclick: showEnrollCommand },
+          "Generate enroll command")));
+  } else {
+    box.append(el("div", { class: "vs-list" }, machines.map((m) => bigItem({
+      icon: m.online ? "●" : "○",
+      title: m.name || m.id.slice(0, 8),
+      sub: m.online ? "online"
+        : m.last_seen_at ? "last seen " + relTime(Date.parse(m.last_seen_at))
+        : "never connected",
+      onclick: () => connectMachine(m.id),
+    }))));
+    box.append(el("div", { class: "enroll-box", id: "enroll-box" },
+      el("button", { class: "btn small", onclick: showEnrollCommand },
+        "+ Add a machine")));
+  }
+  box.append(el("div", { class: "a-buttons", style: "margin-top:18px" },
+    el("button", { class: "btn small", onclick: refreshMachines }, "Refresh"),
+    el("button", { class: "btn small", onclick: renderBillingScreen }, "Billing"),
+    el("button", { class: "btn small", onclick: doLogout }, "Log out")));
+  view.replaceChildren(box);
+}
+
+// -------- platform billing (two buttons — Stripe owns the rest) --------
+
+async function renderBillingScreen() {
+  setTopbar();
+  const view = $("#view");
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Billing"),
+    el("div", { class: "empty" }, "Loading…")));
+  let b;
+  try {
+    b = await api("/api/billing");
+  } catch (e) {
+    view.replaceChildren(el("div", { class: "pad" },
+      el("div", { class: "empty" }, "Could not load billing: " + (e.message || e))));
+    return;
+  }
+  S.plan = b.plan;
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Billing"),
+    el("div", { class: "card" },
+      kvRow("Plan", b.plan === "pro" ? "Pro" : "Free"),
+      b.status ? kvRow("Subscription", b.status) : null,
+      b.current_period_end
+        ? kvRow("Renews", new Date(b.current_period_end).toLocaleDateString())
+        : null),
+    el("div", { class: "notice", style: "margin-top:12px" },
+      b.plan === "pro"
+        ? "Card, invoices and cancellation are managed by Stripe."
+        : "Pro: more machines, more concurrent connections and terminals."),
+    el("div", { class: "a-buttons", style: "margin-top:18px" },
+      b.plan === "pro" ? null
+        : el("button", { class: "btn primary", onclick: startCheckout },
+            "Upgrade to Pro"),
+      el("button", { class: "btn", onclick: openBillingPortal }, "Manage billing"),
+      el("button", { class: "btn small", onclick: () => {
+        if (T && S._stateLoaded) render(); else renderMachinePicker();
+      } }, "Back"))));
+}
+
+async function startCheckout() {
+  try {
+    const r = await api("/api/billing/checkout", { method: "POST" });
+    if (r.url) location.href = r.url;
+  } catch (e) {
+    toast(e.message || "Could not start checkout", true);
+  }
+}
+
+async function openBillingPortal() {
+  try {
+    const r = await api("/api/billing/portal", { method: "POST" });
+    if (r.url) location.href = r.url;
+  } catch (e) {
+    toast(e.message || "Could not open the billing portal", true);
+  }
+}
+
+async function refreshMachines() {
+  try {
+    S.machines = (await api("/api/machines")).machines || [];
+    renderMachinePicker();
+  } catch {}
+}
+
+async function showEnrollCommand() {
+  try {
+    const r = await api("/api/machines/enroll-token", { method: "POST" });
+    const boxEl = $("#enroll-box");
+    if (!boxEl) return;
+    boxEl.replaceChildren(
+      el("div", { class: "enroll-cmd" }, r.command),
+      el("div", { class: "notice" },
+        "Run it in a terminal on that computer (valid 10 minutes), then hit Refresh."),
+      el("button", { class: "btn small", onclick: () => {
+        navigator.clipboard?.writeText(r.command).then(() => toast("Copied"));
+      } }, "Copy command"));
+  } catch (e) {
+    toast(e.message || "Could not create an enroll token", true);
+  }
+}
+
+async function connectMachine(mid, pairing) {
+  localStorage.setItem("bcrc_machine", mid);
+  let session = null;
+  try {
+    // E2E session: device identity + pinned agent key (crypto.js).
+    session = await BcrcCrypto.session(mid, pairing || null);
+  } catch (e) {
+    toast("Crypto init failed: " + (e.message || e), true);
+    return;
+  }
+  if (!session) { renderPairScreen(mid); return; } // not paired yet
+  if (T) { try { T.close(); } catch {} }
+  T = new RelayTransport(mid, session);
+  T.onMessage(handleWS);
+  T.onStatus(onTransportStatus);
+  T.connect();
+  finishBoot();
+}
+
+// -------- pairing screen (scan the agent terminal's QR / paste the code) --
+
+let _scanStop = null;
+
+function stopScanner() {
+  if (_scanStop) { try { _scanStop(); } catch {} _scanStop = null; }
+}
+
+function renderPairScreen(mid) {
+  stopScanner();
+  setTopbar();
+  const err = el("div", { class: "login-err", id: "pair-err" });
+  const video = el("video", { class: "pair-video", playsinline: "",
+    muted: "", style: "display:none" });
+  const paste = el("input", { type: "text", id: "pair-code",
+    placeholder: "BCRC1.…", autocapitalize: "none", autocorrect: "off",
+    spellcheck: "false" });
+  $("#view").replaceChildren(
+    el("div", { class: "login-box" },
+      el("div", { class: "glyph" }, "❯_"),
+      el("h1", null, "Pair this machine"),
+      el("p", null, "In the terminal on that computer, better-claude-rc "
+        + "connect shows a QR code and a pairing code. Scan or paste it "
+        + "here — it never touches the server."),
+      video,
+      el("button", { class: "btn", onclick: () =>
+        startScanner(video, err, (code) => submitPairing(mid, code)) },
+        "Scan QR with camera"),
+      paste,
+      el("button", { class: "btn primary",
+        onclick: () => submitPairing(mid, paste.value) }, "Pair"),
+      el("button", { class: "btn", onclick: () => {
+        stopScanner(); refreshMachines().finally(() => renderMachinePicker());
+      } }, "Back"),
+      err));
+}
+
+async function submitPairing(mid, code) {
+  const qr = BcrcCrypto.parseQr(code);
+  const errEl = $("#pair-err");
+  if (!qr) {
+    if (errEl) errEl.textContent = "That doesn't look like a pairing code";
+    return;
+  }
+  if (qr.agentId !== mid) {
+    if (errEl) errEl.textContent = "This code belongs to a different machine";
+    return;
+  }
+  stopScanner();
+  toast("Pairing…");
+  await connectMachine(mid, qr);
+}
+
+async function startScanner(video, err, onCode) {
+  stopScanner();
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(
+      { video: { facingMode: "environment" } });
+  } catch (e) {
+    err.textContent = "Camera unavailable — paste the code instead";
+    return;
+  }
+  video.srcObject = stream;
+  video.style.display = "block";
+  try { await video.play(); } catch {}
+  let stopped = false;
+  _scanStop = () => {
+    stopped = true;
+    stream.getTracks().forEach((t) => t.stop());
+    video.style.display = "none";
+    video.srcObject = null;
+  };
+  const detector = "BarcodeDetector" in window
+    ? new BarcodeDetector({ formats: ["qr_code"] }) : null;
+  const jsqr = detector ? null : await BcrcCrypto.jsQR().catch(() => null);
+  if (!detector && !jsqr) {
+    err.textContent = "No QR scanner available — paste the code instead";
+    stopScanner();
+    return;
+  }
+  const canvas = document.createElement("canvas");
+  const tick = async () => {
+    if (stopped) return;
+    if (video.readyState >= 2 && video.videoWidth) {
+      try {
+        let text = null;
+        if (detector) {
+          const codes = await detector.detect(video);
+          if (codes.length) text = codes[0].rawValue;
+        } else {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          ctx.drawImage(video, 0, 0);
+          const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const res = jsqr(img.data, img.width, img.height);
+          if (res && res.data) text = res.data;
+        }
+        if (text && text.startsWith("BCRC1.")) {
+          stopScanner();
+          onCode(text);
+          return;
+        }
+      } catch {}
+    }
+    setTimeout(tick, 250);
+  };
+  tick();
+}
+
+// -------- paired devices management (agent-side registry via rpc) --------
+
+async function renderDevicesScreen() {
+  setTopbar(menuBtn(), tbTitle("Devices"), el("div", { class: "tb-spacer" }));
+  const view = $("#view");
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Paired Devices"),
+    el("div", { class: "empty" }, "Loading…")));
+  let devices;
+  try {
+    devices = (await T.rpc("devices.list")).devices || [];
+  } catch (e) {
+    view.replaceChildren(el("div", { class: "pad" },
+      el("div", { class: "empty" }, "Could not load devices: " + e.message)));
+    return;
+  }
+  const mine = T && T.session ? T.session.devicePkB64 : null;
+  view.replaceChildren(el("div", { class: "pad" },
+    el("h2", { class: "home-h" }, "Paired Devices"),
+    devices.length
+      ? el("div", { class: "vs-list" }, devices.map((d) => bigItem({
+          icon: "▣",
+          title: (d.name || "device") + (d.device_pk === mine ? " · this device" : ""),
+          sub: d.device_pk.slice(0, 20) + "…",
+          side: "revoke",
+          onclick: async () => {
+            if (!confirm("Revoke this device? It loses access immediately."))
+              return;
+            try {
+              await T.rpc("devices.revoke", { device_pk: d.device_pk });
+            } catch (e) {
+              if (d.device_pk !== mine) {  // self-revoke kills the pipe
+                toast(e.message || "Revoke failed", true);
+                return;
+              }
+            }
+            toast("Device revoked");
+            if (d.device_pk === mine) doLogout();
+            else renderDevicesScreen();
+          },
+        })))
+      : el("div", { class: "empty" },
+          "No paired devices. Run better-claude-rc connect --pair on the "
+          + "machine to pair another phone."),
+    el("div", { class: "notice", style: "margin-top:12px" },
+      "Devices are stored on the machine itself (devices.json) — the "
+      + "platform never sees them.")));
+}
+
 async function doLogin() {
   const token = $("#tok").value.trim();
   if (!token) return;
@@ -550,7 +898,6 @@ async function doLogin() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token }),
     }).then((r) => { if (!r.ok) throw new Error("Wrong token"); });
-    localStorage.setItem("bcrc_token", token);
     await boot();
   } catch (e) {
     $("#login-err").textContent = e.message || "Login failed";
@@ -713,10 +1060,10 @@ function sessionMenu(s) {
   sheet(s.title || "(session)", [
     { icon: "▶", label: "Open", action: () => openChat(s.sid) },
     { icon: "■", label: "Stop process", sub: "Keeps history; resumes on next message",
-      action: async () => { await api(`/api/sessions/${s.sid}/stop`, { method: "POST" }); toast("Stopped"); } },
+      action: async () => { await T.rpc("sessions.stop", { sid: s.sid }); toast("Stopped"); } },
     { icon: "✕", label: "Delete session", danger: true,
       action: () => confirmSheet(`Delete “${s.title || "session"}”?`, "This removes it from Claude RC. The Claude Code transcript on disk is kept.", async () => {
-        await api(`/api/sessions/${s.sid}`, { method: "DELETE" });
+        await T.rpc("sessions.delete", { sid: s.sid });
         delete S.events[s.sid]; S.subs.delete(s.sid); closeTab(s.sid);
         toast("Deleted");
       }) },
@@ -811,7 +1158,7 @@ async function browseSheet(pick) {
   let current = null;
   const body = el("div");
   const load = async (path) => {
-    const data = await api("/api/browse" + (path ? `?path=${encodeURIComponent(path)}` : ""));
+    const data = await T.rpc("browse", path ? { path } : {});
     current = data.path;
     body.replaceChildren(
       el("div", { class: "sheet-title", style: "word-break:break-all" }, current.replace(S.home, "~")),
@@ -869,7 +1216,7 @@ async function renderProject(path) {
   view.replaceChildren(wrap);
 
   try {
-    const { sessions } = await api(`/api/projects/sessions?cwd=${encodeURIComponent(path)}`);
+    const { sessions } = await T.rpc("projects.sessions", { cwd: path });
     const list = $("#past-list");
     if (!list) return;
     list.replaceChildren();
@@ -904,7 +1251,7 @@ function pastSessionSheet(path, ps, opts) {
       el("div", { class: "notice" }, "loading preview…"))
   );
   rawSheet(body);
-  api(`/api/projects/preview?session_id=${ps.session_id}&cwd=${encodeURIComponent(path)}`)
+  T.rpc("projects.preview", { session_id: ps.session_id, cwd: path })
     .then(({ messages }) => {
       const peek = $("#peek");
       if (!peek) return;
@@ -917,9 +1264,9 @@ function pastSessionSheet(path, ps, opts) {
 
 async function startSession(cwd, opts) {
   try {
-    const snap = await api("/api/sessions", {
-      method: "POST",
-      body: JSON.stringify({ cwd, model: opts.model, mode: opts.mode, resume: opts.resume || null, fork: !!opts.fork, title: opts.title || "" }),
+    const snap = await T.rpc("sessions.create", {
+      cwd, model: opts.model, mode: opts.mode,
+      resume: opts.resume || null, fork: !!opts.fork, title: opts.title || "",
     });
     upsertSession(snap);
     openChat(snap.sid);
@@ -952,6 +1299,8 @@ function renderChat(sid) {
         el("div", { class: "crumb", id: "hdr-title" }, s?.title || "session"),
         el("div", { class: "tb-sub", id: "hdr-sub" }, s?.project || ""))),
     el("div", { class: "tb-chips" },
+      el("button", { class: "tb-btn tb-text", "aria-label": "True View (terminal)",
+        onclick: () => openTrueView(sid) }, ">_"),
       tabsBtn(),
       el("button", { class: "tb-btn", onclick: () => infoSheet(sid) }, "ⓘ"))
   );
@@ -1015,6 +1364,7 @@ function handleLocalCommand(sid, text) {
     case "model": modelSheet(sid); return true;
     case "mode": case "permissions": modeSheet(sid); return true;
     case "info": case "context": infoSheet(sid); return true;
+    case "term": case "terminal": case "trueview": openTrueView(sid); return true;
     case "library": case "skills": nav({ name: "skills" }); return true;
   }
   return false;
@@ -1056,6 +1406,180 @@ function updateStatusLine() {
     btn.textContent = showStop ? "■" : "↑";
     btn.className = "c-btn " + (showStop ? "stop" : "send");
   }
+}
+
+// ---------------------------------------------------------------- true view (real claude TUI)
+
+// The server runs `claude --resume <session>` in a PTY and streams raw bytes
+// here; xterm.js renders the actual terminal UI, so this view mirrors Claude
+// Code exactly. The PTY survives leaving the view — reattach replays scrollback.
+
+const termUI = { sid: null, ws: null, term: null, cleanup: null };
+
+const _assets = {};
+function loadAsset(url, kind) {
+  if (!_assets[url]) {
+    _assets[url] = new Promise((resolve, reject) => {
+      const node = kind === "css"
+        ? el("link", { rel: "stylesheet", href: url })
+        : el("script", { src: url });
+      node.onload = resolve;
+      node.onerror = () => { delete _assets[url]; reject(new Error("failed to load " + url)); };
+      document.head.append(node);
+    });
+  }
+  return _assets[url];
+}
+
+function ensureXterm() {
+  return Promise.all([
+    loadAsset("/vendor/xterm/xterm.css", "css"),
+    loadAsset("/vendor/xterm/xterm.js"),
+    loadAsset("/vendor/xterm/addon-fit.js"),
+  ]);
+}
+
+function disposeTerm() {
+  if (termUI.cleanup) termUI.cleanup();
+  if (termUI.ws) { termUI.ws.onclose = null; termUI.ws.onmessage = null; termUI.ws.close(); }
+  if (termUI.term) termUI.term.dispose();
+  termUI.sid = null; termUI.ws = null; termUI.term = null; termUI.cleanup = null;
+}
+
+function openTrueView(sid) {
+  const s = S.sessions.find((x) => x.sid === sid);
+  if (s && !s.claude_session_id) {
+    toast("No Claude session yet — send a message first", true);
+    return;
+  }
+  nav({ name: "term", sid });
+}
+
+const TERM_KEYS = [
+  ["esc", "\u001b"], ["tab", "\t"], ["\u21e7\u21e5", "\u001b[Z"], ["^C", "\u0003"],
+  ["\u2190", "\u001b[D"], ["\u2191", "\u001b[A"], ["\u2193", "\u001b[B"], ["\u2192", "\u001b[C"],
+  ["\u23ce", "\r"],
+];
+
+function termKeyBar() {
+  return el("div", { id: "term-keys" },
+    TERM_KEYS.map(([label, seq]) => el("button", {
+      class: "term-key",
+      // pointerdown + preventDefault: send the key without stealing focus
+      // from xterm (which would close the mobile keyboard)
+      onpointerdown: (e) => {
+        e.preventDefault();
+        if (termUI.ws && termUI.ws.readyState === 1) {
+          termUI.ws.send(JSON.stringify({ type: "input", data: seq }));
+        }
+      },
+    }, label)));
+}
+
+function renderTerm(sid) {
+  disposeTerm();
+  const s = S.sessions.find((x) => x.sid === sid);
+  setTopbar(
+    backBtn({ name: "chat", sid }),
+    el("div", { class: "tb-title" },
+      el("span", { class: "prompt-glyph" }, "❯_"),
+      el("div", { style: "min-width:0" },
+        el("div", { class: "crumb" }, "True View"),
+        el("div", { class: "tb-sub" }, s?.project || ""))),
+    el("div", { class: "tb-chips" },
+      el("button", { class: "tb-btn tb-text", onclick: () => {
+        confirmSheet("End terminal?", "The Claude TUI process stops. The session stays resumable from the chat.", () => {
+          if (termUI.ws && termUI.ws.readyState === 1) termUI.ws.send('{"type":"kill"}');
+        });
+      } }, "end")),
+  );
+
+  const mount = el("div", { id: "term" });
+  const overlay = el("div", { id: "term-overlay", class: "hidden" });
+  $("#view").replaceChildren(el("div", { id: "term-wrap" },
+    el("div", { id: "term-host" }, mount, overlay), termKeyBar()));
+
+  termUI.sid = sid;
+  overlay.classList.remove("hidden");
+  overlay.replaceChildren(el("div", { class: "term-msg" }, "connecting…"));
+  ensureXterm()
+    .then(() => {
+      if (termUI.sid !== sid || S.view?.name !== "term") return;
+      openTerm(sid, mount, overlay);
+    })
+    .catch(() => showTermOverlay(overlay, sid, "Could not load terminal assets"));
+}
+
+function openTerm(sid, mount, overlay) {
+  const term = new Terminal({
+    fontFamily: 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    scrollback: 4000,
+    theme: {
+      background: "#141210", foreground: "#ede6de",
+      cursor: "#e8825e", cursorAccent: "#141210",
+      selectionBackground: "#3a2a22",
+    },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(mount);
+  fit.fit();
+  termUI.term = term;
+
+  const ws = T.openTerm(sid);
+  ws.binaryType = "arraybuffer";
+  termUI.ws = ws;
+
+  const sendResize = () => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+  };
+  ws.onopen = () => {
+    overlay.classList.add("hidden");
+    fit.fit(); sendResize(); term.focus();
+  };
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") {
+      let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === "exit") showTermOverlay(overlay, sid, msg.reason || "Terminal ended");
+      return;
+    }
+    term.write(new Uint8Array(e.data));
+  };
+  ws.onclose = () => {
+    if (termUI.ws !== ws) return;
+    if (overlay.classList.contains("hidden")) showTermOverlay(overlay, sid, "Disconnected");
+  };
+  term.onData((d) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "input", data: d }));
+  });
+
+  let fitTimer = null;
+  const refit = () => {
+    clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => { fit.fit(); sendResize(); }, 120);
+  };
+  window.addEventListener("resize", refit);
+  const vv = window.visualViewport;
+  if (vv) vv.addEventListener("resize", refit);
+  const ping = setInterval(() => { if (ws.readyState === 1) ws.send('{"type":"ping"}'); }, 25000);
+
+  termUI.cleanup = () => {
+    clearTimeout(fitTimer);
+    clearInterval(ping);
+    window.removeEventListener("resize", refit);
+    if (vv) vv.removeEventListener("resize", refit);
+  };
+}
+
+function showTermOverlay(overlay, sid, reason) {
+  overlay.classList.remove("hidden");
+  overlay.replaceChildren(
+    el("div", { class: "term-msg" }, reason),
+    el("div", { class: "term-actions" },
+      el("button", { onclick: () => renderTerm(sid) }, "reopen"),
+      el("button", { onclick: () => nav({ name: "chat", sid }) }, "back to chat")));
 }
 
 // ---------------------------------------------------------------- transcript rendering
@@ -1579,7 +2103,7 @@ function infoSheet(sid) {
     el("button", { class: "btn", onclick: () => { closeSheet(); wsSend({ type: "compact", session_id: sid, instructions: "" }); } }, "Compact"),
     el("button", { class: "btn", onclick: () => { closeSheet(); confirmClear(sid); } }, "Clear"),
     el("button", { class: "btn", onclick: () => { closeSheet(); wsSend({ type: "refresh_context", session_id: sid }); } }, "Refresh"),
-    el("button", { class: "btn danger", onclick: async () => { closeSheet(); await api(`/api/sessions/${sid}/stop`, { method: "POST" }); } }, "Stop process")));
+    el("button", { class: "btn danger", onclick: async () => { closeSheet(); await T.rpc("sessions.stop", { sid }); } }, "Stop process")));
   rawSheet(body);
 }
 
@@ -1695,31 +2219,97 @@ if (window.visualViewport) {
 // ---------------------------------------------------------------- boot
 
 async function boot() {
-  // token from QR link
-  const params = new URLSearchParams(location.search);
-  if (params.get("token")) {
-    const token = params.get("token");
-    try {
-      await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) })
-        .then((r) => { if (r.ok) localStorage.setItem("bcrc_token", token); });
-    } catch {}
-    history.replaceState(null, "", location.pathname + location.hash);
+  if (!S.mode) S.mode = await fetchEnvMode(); // transport.js; GET /api/env
+  if (S.mode === "platform") { await bootPlatform(); return; }
+
+  if (!T) {
+    T = new LocalTransport();
+    T.onMessage(handleWS);
+    T.onStatus(onTransportStatus);
   }
+
+  // one-time login code from the QR link — fragment only, never query strings
+  const mLogin = (location.hash || "").match(/^#login=([A-Za-z0-9_-]+)$/);
+  if (mLogin) {
+    history.replaceState(null, "", location.pathname);
+    try {
+      await fetch("/api/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: mLogin[1] }),
+      });
+    } catch {}
+  }
+
+  await finishBoot();
+}
+
+async function bootPlatform() {
+  // Stripe redirects land on #billing=success|cancelled — toast + strip
+  const mBill = (location.hash || "").match(/^#billing=([a-z_]+)$/);
+  if (mBill) {
+    history.replaceState(null, "", location.pathname);
+    if (mBill[1] === "success") toast("Payment complete — you're on Pro");
+    else if (mBill[1] === "cancelled") toast("Checkout cancelled");
+  }
+
+  // magic-link token arrives in the URL fragment — never a query string
+  const mAuth = (location.hash || "").match(/^#auth=([A-Za-z0-9_-]+)$/);
+  if (mAuth) {
+    history.replaceState(null, "", location.pathname);
+    try {
+      await api("/api/auth/redeem", {
+        method: "POST", body: JSON.stringify({ token: mAuth[1] }),
+      });
+    } catch {}
+  }
+
+  let me;
   try {
-    const state = await api("/api/state");
+    me = await api("/api/me");
+  } catch {
+    S.authed = false;
+    renderLogin();
+    return;
+  }
+  S.authed = true;
+  S.email = me.email;
+  S.plan = me.plan;
+  try {
+    S.machines = (await api("/api/machines")).machines || [];
+  } catch {
+    S.machines = [];
+  }
+
+  let mid = localStorage.getItem("bcrc_machine");
+  if (!S.machines.some((m) => m.id === mid)) mid = null;
+  if (!mid && S.machines.length === 1) mid = S.machines[0].id; // auto-skip
+  if (!mid) { renderMachinePicker(); return; }
+  connectMachine(mid);
+}
+
+async function finishBoot() {
+  try {
+    const state = await T.rpc("state");
     S.authed = true;
+    S._stateLoaded = true;
     S.sessions = state.sessions;
     S.defaults = state.defaults;
     S.home = state.home;
     for (const s of S.sessions) S.status[s.sid] = { state: s.state, detail: s.detail };
     pruneTabs();
-    wsConnect();
     // warm caches so home and the drawer paint instantly
     loadProjects().then(() => { if (S.view?.name === "home") renderHome(); }).catch(() => {});
     loadLibrary().catch(() => {});
     S.view = routeFromHash();
     render();
   } catch {
+    if (S.mode === "platform") {
+      // the machine is offline or still connecting: show the app shell with
+      // the offline pill; events flow in once machine_status goes online
+      S.view = routeFromHash();
+      render();
+      return;
+    }
     S.authed = false;
     renderLogin();
   }

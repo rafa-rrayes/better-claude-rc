@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Better Claude RC — drive Claude Code from your phone</title>
+<meta name="description" content="Better Claude RC pairs your phone with Claude Code running on your Mac — end-to-end encrypted, through a relay that can't read a byte.">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#141210">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#F6F1EA">
+<link rel="icon" type="image/png" href="/icon-180.png">
+<style>
+  :root {
+    --bg: #141210; --surface: #1e1b18; --border: #362f28;
+    --text: #ede6de; --dim: #a2968a; --faint: #6e645a;
+    --accent: #e8825e; --ok: #8fb573; --err: #e05d52;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f1ea; --surface: #fffdf9; --border: #e0d5c7;
+      --text: #2b241d; --dim: #6e645a; --faint: #a2968a;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--sans);
+    line-height: 1.55; -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 620px; margin: 0 auto; padding: 48px 24px 80px; }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 48px; }
+  .brand img { width: 40px; height: 40px; border-radius: 9px; }
+  .brand span { font-family: var(--mono); font-size: 15px; color: var(--dim); }
+  h1 { font-size: clamp(28px, 6vw, 40px); line-height: 1.15; letter-spacing: -0.02em; }
+  h1 em { color: var(--accent); font-style: normal; }
+  .sub { color: var(--dim); font-size: 17px; margin: 16px 0 36px; }
+  form { display: flex; gap: 10px; flex-wrap: wrap; }
+  input[type=email] {
+    flex: 1 1 240px; padding: 13px 16px; font-size: 16px; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    outline: none;
+  }
+  input[type=email]:focus { border-color: var(--accent); }
+  button {
+    padding: 13px 22px; font-size: 16px; font-weight: 600; cursor: pointer;
+    color: #1a120d; background: var(--accent); border: 0; border-radius: 10px;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  #status { min-height: 24px; margin-top: 12px; font-size: 15px; color: var(--dim); }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  .hint { font-size: 14px; color: var(--faint); margin-top: 4px; }
+  .hint a { color: var(--dim); }
+  section { margin-top: 56px; }
+  h2 { font-size: 15px; font-family: var(--mono); font-weight: 600;
+       color: var(--faint); text-transform: uppercase; letter-spacing: 0.08em;
+       margin-bottom: 16px; }
+  ol { padding-left: 22px; color: var(--dim); display: grid; gap: 10px; }
+  ol strong { color: var(--text); font-weight: 600; }
+  pre {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 14px;
+    color: var(--text); margin: 10px 0 0;
+  }
+  pre .p { color: var(--faint); user-select: none; }
+  .cards { display: grid; gap: 12px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px;
+  }
+  .card b { display: block; margin-bottom: 4px; }
+  .card p { color: var(--dim); font-size: 15px; }
+  footer { margin-top: 64px; font-size: 13px; color: var(--faint); }
+  footer a { color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">
+    <img src="/icon-180.png" alt="">
+    <span>Better Claude RC</span>
+  </div>
+
+  <h1>Drive Claude Code on your Mac — <em>from your phone</em>.</h1>
+  <p class="sub">
+    Kick off sessions, review diffs, approve permissions and drop into a real
+    terminal from anywhere. End-to-end encrypted: the relay moves ciphertext
+    and can't read a byte of your code.
+  </p>
+
+  <form id="signup" autocomplete="email">
+    <input id="email" type="email" name="email" placeholder="you@example.com"
+           required maxlength="254" inputmode="email">
+    <button id="send" type="submit">Email me a sign-in link</button>
+  </form>
+  <p id="status" role="status"></p>
+  <p class="hint">No password — a single-use magic link signs you in.
+     Already signed in on this phone? <a href="/app">Open the app</a>.</p>
+
+  <section>
+    <h2>How it works</h2>
+    <ol>
+      <li><strong>Sign in</strong> here and add your Mac from the dashboard.</li>
+      <li><strong>Enroll the agent</strong> — paste the one-line command from
+        your dashboard into a terminal on the Mac that runs Claude Code:
+        <pre><span class="p">$ </span>curl -fsSL https://…/i/bcrc_enr_… | bash</pre>
+      </li>
+      <li><strong>Scan the QR</strong> it prints with your phone — that pairing
+          is the encryption root; the platform never sees the keys.</li>
+      <li><strong>Go.</strong> Your phone talks to your Mac through the relay:
+          live sessions, terminals, permission prompts, session history.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Why it's safe</h2>
+    <div class="cards">
+      <div class="card">
+        <b>Blind relay</b>
+        <p>Traffic is sealed phone↔Mac with keys born from the QR pairing.
+           The server routes opaque frames — no prompts, no code, no keys.</p>
+      </div>
+      <div class="card">
+        <b>Your machine, your rules</b>
+        <p>Claude Code runs on your Mac exactly as it does today. Revoke a
+           machine or a phone at any time from the dashboard.</p>
+      </div>
+      <div class="card">
+        <b>No passwords stored</b>
+        <p>Magic-link sign-in; every credential is kept hashed. Free tier
+           includes one Mac — Pro adds more machines and terminals.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Better Claude RC · <a href="/app">Open the app</a> ·
+    <a href="https://github.com/rafa-rrayes/better-claude-rc">GitHub</a>
+  </footer>
+</main>
+<script src="/landing/landing.js"></script>
+</body>
+</html>

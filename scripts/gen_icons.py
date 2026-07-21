@@ -5,7 +5,7 @@ import struct
 import zlib
 from pathlib import Path
 
-WEB = Path(__file__).resolve().parent.parent / "web"
+WEB = Path(__file__).resolve().parent.parent / "server" / "web"
 
 BG = (20, 18, 16)
 TILE = (30, 27, 24)

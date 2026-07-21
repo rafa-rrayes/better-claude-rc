@@ -688,3 +688,59 @@ a { color: var(--accent); }
   text-align: center; padding: 4px; background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
+
+/* ---------- true view (real claude TUI) ---------- */
+/* Always dark: it's a terminal, and the TUI's ANSI palette assumes one. */
+#term-wrap {
+  display: flex; flex-direction: column;
+  height: 100%; background: #141210;
+}
+#term-host { position: relative; flex: 1; min-height: 0; padding: 6px 0 0 8px; }
+#term { height: 100%; }
+#term .xterm { height: 100%; }
+#term-overlay {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; padding: 20px; text-align: center;
+  background: rgba(13, 11, 9, 0.85);
+  font-family: var(--mono); font-size: 13px; color: #ede6de;
+}
+#term-overlay.hidden { display: none; }
+#term-overlay .term-actions { display: flex; gap: 10px; }
+#term-overlay button {
+  font-family: var(--mono); font-size: 13px; padding: 8px 16px;
+  border: 1px solid #4a4038; border-radius: 9px;
+  color: #ede6de; background: #28241f;
+}
+#term-overlay button:active { border-color: #e8825e; color: #e8825e; }
+#term-keys {
+  flex: none; display: flex; gap: 6px; overflow-x: auto;
+  padding: 8px 10px calc(max(var(--sab), var(--kb)) + 8px);
+  background: #1e1b18; border-top: 1px solid #362f28;
+}
+.term-key {
+  font-family: var(--mono); font-size: 13px; color: #a2968a;
+  border: 1px solid #362f28; background: #28241f; border-radius: 8px;
+  padding: 7px 13px; flex: none; line-height: 1;
+}
+.term-key:active { color: #e8825e; border-color: #e8825e; }
+
+/* ------------------------------------------------ platform: machine picker */
+.machines { max-width: 520px; margin: 0 auto; }
+.enroll-box { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.enroll-cmd {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  padding: 12px 14px; border-radius: 10px; word-break: break-all;
+  user-select: all; -webkit-user-select: all;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--accent);
+}
+
+/* ------------------------------------------------ platform: pairing (M4) */
+.pair-video {
+  width: 100%; max-width: 320px; border-radius: 12px;
+  border: 1px solid var(--border); margin: 0 auto 12px; display: block;
+  background: #000;
+}
+.login-box .btn { margin-bottom: 10px; }
+.login-box input#pair-code { font-family: var(--mono); font-size: 12px; }

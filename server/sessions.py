@@ -640,6 +640,17 @@ class SessionRunner:
                 await client.disconnect()
         self._closing = False
 
+    async def detach_for_terminal(self) -> None:
+        """Hand the claude session over to a True View terminal: stop our
+        subprocess so the TUI owns the transcript. The watcher keeps
+        mirroring its turns into the chat log, and the next chat message
+        resumes our client via the context_stale rotation."""
+        self._fail_pending("Handed off to terminal view")
+        await self._teardown_client()
+        self._tail_ff = True  # mirror only rows the terminal writes from now
+        self.set_status("detached", "In terminal view")
+        self.save_meta()
+
     async def stop(self) -> None:
         """Stop the subprocess; session stays resumable."""
         self._fail_pending("Session stopped")
