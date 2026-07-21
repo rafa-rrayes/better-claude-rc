@@ -6,7 +6,7 @@ both relay WS legs refusing unauthenticated connects. With --email it also
 sends one real magic link (the only write; rate-limited server-side).
 
 Run:
-    uv run python scripts/smoke_platform.py https://bcrc.rrayes.com.br \
+    uv run python scripts/smoke_platform.py https://bcrc.rrayes.com \
         [--email you@example.com] [--metrics-token TOKEN]
 
 Exit code 1 if any check fails.
@@ -59,7 +59,7 @@ async def expect_ws_close(url: str, code: int,
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("base_url", help="e.g. https://bcrc.rrayes.com.br")
+    ap.add_argument("base_url", help="e.g. https://bcrc.rrayes.com")
     ap.add_argument("--email", help="send one real magic link to this address")
     ap.add_argument("--metrics-token", help="PLATFORM_METRICS_TOKEN if the "
                     "deployment gates /metrics")

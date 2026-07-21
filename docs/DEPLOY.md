@@ -1,6 +1,6 @@
 # Deploying the bcrc platform
 
-Production: Dokploy VPS, Cloudflare-proxied `bcrc.rrayes.com.br` (TLS at the
+Production: Dokploy VPS, Cloudflare-proxied `bcrc.rrayes.com` (TLS at the
 CF edge, plain HTTP to the origin), Dokploy-managed Postgres, Resend email,
 Stripe billing. Operations after deploy: [RUNBOOK.md](RUNBOOK.md).
 
@@ -10,10 +10,10 @@ Stripe billing. Operations after deploy: [RUNBOOK.md](RUNBOOK.md).
 | --- | --- | --- |
 | `PLATFORM_ENV` | baked into image | `production` — refuses boot if DB/base-URL/email are missing or still dev-mode |
 | `PLATFORM_DATABASE_URL` | yes | `postgresql://bcrc:<pw>@<internal-host>:5432/bcrc` (Dokploy internal hostname) |
-| `PLATFORM_BASE_URL` | yes | `https://bcrc.rrayes.com.br` — used in magic-link URLs |
+| `PLATFORM_BASE_URL` | yes | `https://bcrc.rrayes.com` — used in magic-link URLs |
 | `PLATFORM_EMAIL_MODE` | yes | `resend` (`dev` only logs links; prod refuses it) |
 | `RESEND_API_KEY` | yes | from resend.com; boot fails fast if missing |
-| `PLATFORM_EMAIL_FROM` | yes | `Better Claude RC <login@bcrc.rrayes.com.br>` — domain must be DKIM-verified in Resend |
+| `PLATFORM_EMAIL_FROM` | yes | `Better Claude RC <login@bcrc.rrayes.com>` — domain must be DKIM-verified in Resend |
 | `STRIPE_SECRET_KEY` | yes | test mode at launch (`sk_test_…`) |
 | `STRIPE_PRICE_ID` | yes | $5/mo price (`price_…`) |
 | `STRIPE_WEBHOOK_SECRET` | yes | from the webhook endpoint (`whsec_…`) |
@@ -33,7 +33,7 @@ Stripe billing. Operations after deploy: [RUNBOOK.md](RUNBOOK.md).
      is in-memory; two live containers = phones and agents split across
      processes that can't see each other.
    - Env: the table above.
-   - Domain: `bcrc.rrayes.com.br` → container port 8500, HTTPS **off** at
+   - Domain: `bcrc.rrayes.com` → container port 8500, HTTPS **off** at
      the origin (Cloudflare terminates TLS).
 3. Nightly backup Schedule on the postgres service → RUNBOOK §Backups.
 
@@ -47,7 +47,7 @@ every relay leg with close 1012 so clients reconnect instantly.
 - SSL mode "Flexible" or "Full" to match the other apps on this box.
 - **Rocket Loader OFF** for this zone/host (it rewrites `<script>` tags; the
   CSP forbids the injected inline shim and the PWA breaks).
-- Cache rule: bypass cache for `bcrc.rrayes.com.br/*`. The app also sends
+- Cache rule: bypass cache for `bcrc.rrayes.com/*`. The app also sends
   `Cache-Control: no-cache` on non-API paths as belt-and-suspenders.
 - WebSockets: on by default; no config needed for `/agent/ws` + `/client/ws`.
 
@@ -57,7 +57,7 @@ every relay leg with close 1012 so clients reconnect instantly.
 2. Verify the sending domain (add Resend's DKIM/SPF records in Cloudflare
    DNS — DNS-only, not proxied).
 3. `PLATFORM_EMAIL_FROM` must use that domain, e.g.
-   `Better Claude RC <login@bcrc.rrayes.com.br>`.
+   `Better Claude RC <login@bcrc.rrayes.com>`.
 4. Failures show up as `bcrc_emails_sent_total{status="error"}` and
    `resend refused` log lines; the API response to users stays a generic
    200 (no enumeration).
@@ -66,7 +66,7 @@ every relay leg with close 1012 so clients reconnect instantly.
 
 1. Product "Better Claude RC Pro", recurring $5/month → `STRIPE_PRICE_ID`.
 2. After the domain is live: Developers → Webhooks → endpoint
-   `https://bcrc.rrayes.com.br/api/stripe/webhook` with events
+   `https://bcrc.rrayes.com/api/stripe/webhook` with events
    `checkout.session.completed`, `customer.subscription.updated`,
    `customer.subscription.deleted`, `invoice.payment_failed`
    → `STRIPE_WEBHOOK_SECRET`.

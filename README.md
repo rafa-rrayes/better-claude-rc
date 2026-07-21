@@ -86,7 +86,7 @@ uv run python -m server --host 127.0.0.1   # bind localhost only (see Security)
 
 ## Hosted platform
 
-[bcrc.rrayes.com.br](https://bcrc.rrayes.com.br) is the hosted way to reach
+[bcrc.rrayes.com](https://bcrc.rrayes.com) is the hosted way to reach
 your Mac from anywhere, on cellular, with nothing to configure:
 
 1. **Sign up** with your email (magic link, no password).
@@ -145,7 +145,7 @@ source of truth both append to):
 ## Development
 
 The backend is a normal FastAPI app under `server/`; the frontend is a single
-vanilla-JS SPA under `web/` (no build step — edit and reload).
+vanilla-JS SPA under `server/web/` (no build step — edit and reload).
 
 ```bash
 uv run python scripts/smoke_api.py    # REST smoke suite
