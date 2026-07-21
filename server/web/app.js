@@ -829,7 +829,7 @@ async function startScanner(video, err, onCode) {
           const res = jsqr(img.data, img.width, img.height);
           if (res && res.data) text = res.data;
         }
-        if (text && text.startsWith("BCRC1.")) {
+        if (text && (text.startsWith("BCRC1.") || text.includes("#pair="))) {
           stopScanner();
           onCode(text);
           return;
@@ -2244,6 +2244,21 @@ async function boot() {
 }
 
 async function bootPlatform() {
+  // pairing payload from the terminal QR — fragment only, stripped from the
+  // URL immediately. Parked in localStorage (TTL = the agent's 10-minute
+  // pairing window) so it survives the magic-link login round trip, which
+  // usually lands in a different tab.
+  const mPair = (location.hash || "").match(/^#pair=(.+)$/);
+  if (mPair) {
+    history.replaceState(null, "", location.pathname);
+    let p = mPair[1];
+    try { p = decodeURIComponent(p); } catch {}
+    if (BcrcCrypto.parseQr(p)) {
+      localStorage.setItem("bcrc_pending_pair",
+        JSON.stringify({ p, exp: Date.now() + 10 * 60 * 1000 }));
+    }
+  }
+
   // Stripe redirects land on #billing=success|cancelled — toast + strip
   const mBill = (location.hash || "").match(/^#billing=([a-z_]+)$/);
   if (mBill) {
@@ -2280,11 +2295,35 @@ async function bootPlatform() {
     S.machines = [];
   }
 
+  // a camera-scanned pairing QR names its machine — go straight there
+  const pendingPair = takePendingPair();
+  if (pendingPair) {
+    const qr = BcrcCrypto.parseQr(pendingPair);
+    if (qr && S.machines.some((m) => m.id === qr.agentId)) {
+      toast("Pairing…");
+      connectMachine(qr.agentId, qr);
+      return;
+    }
+    toast("That pairing code doesn't match a machine in your account", true);
+  }
+
   let mid = localStorage.getItem("bcrc_machine");
   if (!S.machines.some((m) => m.id === mid)) mid = null;
   if (!mid && S.machines.length === 1) mid = S.machines[0].id; // auto-skip
   if (!mid) { renderMachinePicker(); return; }
   connectMachine(mid);
+}
+
+function takePendingPair() {
+  const raw = localStorage.getItem("bcrc_pending_pair");
+  if (!raw) return null;
+  localStorage.removeItem("bcrc_pending_pair"); // single shot, like the code
+  try {
+    const { p, exp } = JSON.parse(raw);
+    return exp > Date.now() ? p : null;
+  } catch {
+    return null;
+  }
 }
 
 async function finishBoot() {
