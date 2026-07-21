@@ -62,17 +62,19 @@ def _serve(args: argparse.Namespace) -> None:
     uvicorn.run(main_mod.app, host=cfg.host, port=cfg.port, log_level="warning")
 
 
-def _print_pairing(pairing, no_qr: bool) -> None:
-    """The pairing QR: BCRC1.<agent_id>.<b64 agent_pk>.<b64 secret>. The
-    secret exists only in this process's RAM — the relay never sees it."""
+def _print_pairing(pairing, no_qr: bool, app_url: str) -> None:
+    """The pairing QR: <app_url>#pair=BCRC1.<agent_id>.<b64 pk>.<b64 secret>,
+    so a phone-camera scan opens the PWA, which pairs from the fragment. The
+    secret rides the URL *fragment* — never a query string — and exists only
+    in this process's RAM: the relay never sees it."""
     payload = pairing.qr_payload()
-    print("  Pair your phone: open the app, choose this machine and scan"
-          " the QR\n  (or paste the code).\n")
+    print("  Pair your phone: scan the QR with the phone camera, or open"
+          " the app\n  and paste the code.\n")
     if not no_qr:
         try:
             import qrcode
             qr = qrcode.QRCode(border=1)
-            qr.add_data(payload)
+            qr.add_data(f"{app_url}#pair={payload}")
             qr.make(fit=True)
             qr.print_ascii(invert=True)
         except Exception:
@@ -159,7 +161,8 @@ def _connect(args: argparse.Namespace) -> None:
     pairing = None
     if len(devices) == 0 or args.pair:
         pairing = Pairing.generate(machine_id, identity.public_key)
-        _print_pairing(pairing, args.no_qr)
+        _print_pairing(pairing, args.no_qr,
+                       platform_http_url(relay) + "/app")
 
     try:
         asyncio.run(_connect_run(main_mod, host, port, relay, machine_id,

@@ -175,7 +175,11 @@ const BcrcCrypto = (() => {
   // ---------------- pairing QR ----------------
 
   function parseQr(text) {
-    const t = String(text || "").trim();
+    let t = String(text || "").trim();
+    // the terminal QR wraps the payload in <app-url>#pair=… so a phone-camera
+    // scan opens the PWA; accept the bare payload and the URL form alike
+    const m = t.match(/#pair=([^&\s]+)/);
+    if (m) { try { t = decodeURIComponent(m[1]); } catch { t = m[1]; } }
     const parts = t.split(".");
     if (parts.length !== 4 || parts[0] !== QR_PREFIX) return null;
     try {
