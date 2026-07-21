@@ -252,6 +252,7 @@ class Uplink:
                                                      self.identity)}
         async with websockets.connect(
                 url, additional_headers=headers,
+                user_agent_header=f"better-claude-rc/{VERSION}",
                 ping_interval=self.ping_interval,
                 ping_timeout=self.ping_timeout,
                 max_size=proto.FRAME_MAX_WIRE) as ws:

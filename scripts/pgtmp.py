@@ -94,6 +94,24 @@ def start() -> TempPg:
     return _start_pgctl()
 
 
+def _main() -> None:
+    import asyncio
+
+    pg = start()
+    try:
+        asyncio.run(wait_ready(pg.dsn))
+        print(f"DSN (this machine):     {pg.dsn}")
+        print("DSN (from a container): "
+              + pg.dsn.replace("127.0.0.1", "host.docker.internal"))
+        print("Postgres is up — Ctrl-C to stop and tear down.", flush=True)
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pg.stop()
+
+
 async def wait_ready(dsn: str, timeout: float = 90.0) -> None:
     """Retry-connect until the server accepts queries (the docker image
     restarts once during init, so a single successful TCP dial is not
@@ -113,3 +131,7 @@ async def wait_ready(dsn: str, timeout: float = 90.0) -> None:
             last = e
             await asyncio.sleep(0.4)
     raise RuntimeError(f"postgres not ready after {timeout}s: {last!r}")
+
+
+if __name__ == "__main__":
+    _main()
