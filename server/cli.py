@@ -121,11 +121,20 @@ def _connect(args: argparse.Namespace) -> None:
                 platform_http_url(relay), args.enroll_token, identity,
                 name=socket.gethostname(), agent_version=VERSION,
                 proto=proto.PROTO)
+            identity.save()
+            print(f"[bcrc] machine enrolled — id {identity.machine_id}")
         except EnrollError as e:
-            print(f"[bcrc] {e}")
-            sys.exit(1)
-        identity.save()
-        print(f"[bcrc] machine enrolled — id {identity.machine_id}")
+            # 409 = this pubkey is already registered (installer re-run,
+            # agent upgrade): keep the enrolled identity and carry on.
+            if "409" in str(e) and identity.machine_id:
+                print("[bcrc] already enrolled — continuing")
+            else:
+                print(f"[bcrc] {e}")
+                sys.exit(1)
+        # Remember the relay so later bare `connect` runs need no --relay.
+        if cfg.extra.get("relay_url") != relay:
+            cfg.extra["relay_url"] = relay
+            cfg.save()
 
     machine_id = identity.machine_id
     if not machine_id:
@@ -134,8 +143,8 @@ def _connect(args: argparse.Namespace) -> None:
         machine_id = (os.environ.get("BCRC_MACHINE_ID")
                       or cfg.extra.get("machine_id"))
         if not machine_id:
-            print("This machine is not enrolled. Get a command from the "
-                  "dashboard:\n  uvx better-claude-rc connect <enroll-token>")
+            print("This machine is not enrolled. In the dashboard choose "
+                  "Add a machine and run the install command it shows.")
             sys.exit(2)
 
     print()

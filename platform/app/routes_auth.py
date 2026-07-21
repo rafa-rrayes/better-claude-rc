@@ -9,15 +9,14 @@ server logs or Referer headers. redeem -> __Host-bcrc_sess session cookie
 from __future__ import annotations
 
 import logging
-import os
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from . import db as dbmod
-from .deps import SESSION_COOKIE, check_origin, current_user, get_db
-from .emailer import get_sender
+from .deps import SESSION_COOKIE, base_url, check_origin, current_user, get_db
+from .emailer import EmailError, get_sender
 from .limits import SlidingWindow, limiter
 
 log = logging.getLogger("bcrc.auth")
@@ -27,11 +26,6 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # magic links: 3/h per email (plus slowapi's per-IP guard on the route)
 _email_window = SlidingWindow(max_events=3, window_s=3600)
-
-
-def _base_url(request: Request) -> str:
-    return (os.environ.get("PLATFORM_BASE_URL")
-            or str(request.base_url)).rstrip("/")
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
@@ -51,7 +45,8 @@ class Redeem(BaseModel):
 
 @router.post("/api/auth/request-link", dependencies=[Depends(check_origin)])
 @limiter.limit("20/hour")
-async def request_link(request: Request, body: RequestLink):
+async def request_link(request: Request, body: RequestLink,
+                       response: Response):
     email = body.email.strip().lower()
     if not _EMAIL_RE.match(email) or len(email) > 254:
         raise HTTPException(status_code=400, detail="invalid email")
@@ -62,10 +57,16 @@ async def request_link(request: Request, body: RequestLink):
     user = await db.upsert_user(email)
     token = await db.create_token(user["id"], "magic_link",
                                   dbmod.MAGIC_LINK_TTL_S)
-    link = f"{_base_url(request)}/#auth={token}"
-    await get_sender().send(
-        email, "Sign in to Better Claude RC",
-        f"Tap to sign in (valid 15 minutes, single use):\n\n{link}\n")
+    # /app serves the PWA even without a session — an anonymous click must
+    # redeem there, not bounce off the landing page at /.
+    link = f"{base_url(request)}/app#auth={token}"
+    try:
+        await get_sender().send(
+            email, "Sign in to Better Claude RC",
+            f"Tap to sign in (valid 15 minutes, single use):\n\n{link}\n")
+    except EmailError:
+        pass  # already logged + counted; response stays a generic 200
+
     await db.audit("auth.magic_link_requested", user_id=user["id"])
     return {"ok": True}
 

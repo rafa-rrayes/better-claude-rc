@@ -228,12 +228,12 @@ class Uplink:
                 log.info("uplink error: %r", e)
             if code in _FATAL_UNAUTHORIZED:
                 print("[bcrc] The relay refused this agent (unauthorized/"
-                      "revoked).\n       Re-enroll from your dashboard:  "
-                      "uvx better-claude-rc connect <enroll-token>")
+                      "revoked).\n       Re-enroll: in the dashboard choose "
+                      "Add a machine and run the install command it shows.")
                 return
             if code == proto.CLOSE_UPGRADE_REQUIRED:
-                print("[bcrc] The relay requires a newer agent — upgrade "
-                      "with:  uvx better-claude-rc@latest connect")
+                print("[bcrc] The relay requires a newer agent — re-run the "
+                      "install command from your dashboard to upgrade.")
                 return
             if self._welcomed:
                 attempt = 0

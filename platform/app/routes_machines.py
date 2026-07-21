@@ -14,13 +14,14 @@ import binascii
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import db as dbmod
-from . import quotas, relay
+from . import installer, quotas, relay
 from .db import QuotaExceeded
-from .deps import check_origin, current_user, get_db
+from .deps import base_url, check_origin, current_user, get_db
 from .limits import limiter
 
 log = logging.getLogger("bcrc.machines")
@@ -37,13 +38,45 @@ def _mid(machine_id: str) -> uuid.UUID:
 @router.post("/api/machines/enroll-token",
              dependencies=[Depends(check_origin)])
 @limiter.limit("10/hour")
-async def create_enroll_token(request: Request, user=Depends(current_user)):
+async def create_enroll_token(request: Request, response: Response,
+                              user=Depends(current_user)):
     db = get_db(request)
     token = await db.create_token(user["id"], "enroll", dbmod.ENROLL_TTL_S,
                                   prefix=dbmod.ENROLL_PREFIX)
     await db.audit("machine.enroll_token_created", user_id=user["id"])
     return {"token": token, "expires_in": dbmod.ENROLL_TTL_S,
-            "command": f"uvx better-claude-rc connect {token}"}
+            "command": f"curl -fsSL {base_url(request)}/i/{token} | bash"}
+
+
+@router.get("/i/{token}", response_class=PlainTextResponse)
+@limiter.limit("30/hour")
+async def install_script(request: Request, token: str, response: Response):
+    """The one-line installer: installs uv + the self-hosted agent wheel,
+    then runs `connect <token> --relay wss://<host>`. Only the token's
+    *format* is checked here — POST /api/enroll stays the single place the
+    token is validated and burned, so fetching the script never spends it."""
+    if not installer.TOKEN_RE.match(token):
+        raise HTTPException(status_code=404, detail="not found")
+    wheel = installer.find_wheel()
+    if wheel is None:
+        raise HTTPException(status_code=503,
+                            detail="installer unavailable (no agent wheel)")
+    script = installer.render_script(base_url(request), token, wheel)
+    # The script embeds a live enroll token — keep it out of every cache.
+    return PlainTextResponse(script, media_type="text/x-shellscript",
+                             headers={"Cache-Control": "no-store"})
+
+
+@router.get("/dist/{filename}")
+async def dist_wheel(filename: str):
+    """Serve the agent wheel only — never a directory listing, and never the
+    private bcrc_platform wheel a stray bare `uv build` may have dropped in
+    the same dist/ (docs/DEPLOY.md forbids uploading it anywhere)."""
+    if filename != installer.find_wheel():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(installer.dist_dir() / filename,
+                        media_type="application/octet-stream",
+                        filename=filename)
 
 
 class EnrollBody(BaseModel):
@@ -56,7 +89,7 @@ class EnrollBody(BaseModel):
 
 @router.post("/api/enroll")
 @limiter.limit("10/hour")
-async def enroll(request: Request, body: EnrollBody):
+async def enroll(request: Request, body: EnrollBody, response: Response):
     """Called by the agent (no session): burns the enroll token and
     registers the machine's public key."""
     db = get_db(request)

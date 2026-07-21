@@ -8,9 +8,21 @@ import time
 from collections import deque
 
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address)
+
+def client_ip(request) -> str:
+    """Real client IP for rate-limit keys. In production we sit behind
+    Cloudflare + Traefik: CF-Connecting-IP is set by the edge and cannot be
+    spoofed by the client (leftmost X-Forwarded-For can). Falls back to the
+    socket peer for direct/local connections. Works for both HTTP Requests
+    and WebSocket upgrades (both expose .headers and .client)."""
+    ip = request.headers.get("cf-connecting-ip")
+    if ip:
+        return ip.strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+
+limiter = Limiter(key_func=client_ip, headers_enabled=True)
 
 
 class SlidingWindow:

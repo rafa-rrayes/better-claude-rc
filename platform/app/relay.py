@@ -55,7 +55,7 @@ from server import proto
 from . import metrics, quotas
 from .db import Db
 from .deps import SESSION_COOKIE
-from .limits import SlidingWindow
+from .limits import SlidingWindow, client_ip
 
 log = logging.getLogger("bcrc.relay")
 router = APIRouter()
@@ -191,8 +191,7 @@ async def authenticate_client(ws: WebSocket,
     if DB is None:
         log.warning("client auth: no database configured — permissive dev mode")
         return "anon", "free"
-    ip = ws.client.host if ws.client else "?"
-    if not _ws_connect_window.allow(ip):
+    if not _ws_connect_window.allow(client_ip(ws)):
         metrics.QUOTA_DENIALS.labels("ws_connect").inc()
         await _refuse(ws, "client", 1013, "rate limited")  # try again later
         return None
@@ -225,6 +224,7 @@ class Link:
         self.ws = ws
         self.q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=qsize)
         self.dead = False
+        self._closed = False
         self._sender: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -251,6 +251,10 @@ class Link:
         return self.try_put(ctrl_frame(msg))
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
+        # Idempotent: shutdown drain and the endpoint's finally both close.
+        if self._closed:
+            return
+        self._closed = True
         self.dead = True
         if self._sender is not None:
             self._sender.cancel()
@@ -312,6 +316,19 @@ class Router:
     def term_channels(self, machine: str) -> int:
         return sum(1 for (m, _ch), kind in self.channel_kind.items()
                    if m == machine and kind == "term")
+
+    async def drain(self) -> None:
+        """SIGTERM: close every live leg with 1012 so agents/clients
+        reconnect immediately instead of waiting out a dead socket. Routing
+        dicts are NOT cleared — each endpoint's finally owns its cleanup."""
+        links = [*self.agents.values(),
+                 *(c for s in self.clients.values() for c in s)]
+        if not links:
+            return
+        log.info("drain: closing %d live link(s) for shutdown", len(links))
+        await asyncio.gather(
+            *(link.close(1012, "server restart") for link in links),
+            return_exceptions=True)
 
 
 ROUTER = Router()

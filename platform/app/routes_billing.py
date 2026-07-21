@@ -19,19 +19,14 @@ import logging
 import os
 
 import stripe
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from .deps import check_origin, current_user, get_db
+from .deps import base_url, check_origin, current_user, get_db
 from .limits import limiter
 from .stripe_webhooks import fake_billing
 
 log = logging.getLogger("bcrc.billing")
 router = APIRouter()
-
-
-def _base_url(request: Request) -> str:
-    return (os.environ.get("PLATFORM_BASE_URL")
-            or str(request.base_url)).rstrip("/")
 
 
 def _stripe_conf() -> tuple[str, str]:
@@ -57,9 +52,10 @@ async def billing_info(request: Request, user=Depends(current_user)):
 
 @router.post("/api/billing/checkout", dependencies=[Depends(check_origin)])
 @limiter.limit("10/hour")
-async def create_checkout(request: Request, user=Depends(current_user)):
+async def create_checkout(request: Request, response: Response,
+                          user=Depends(current_user)):
     db = get_db(request)
-    base = _base_url(request)
+    base = base_url(request)
     if fake_billing():
         return {"url": f"{base}/#billing=fake_checkout"}
     key, price = _stripe_conf()
@@ -93,9 +89,10 @@ async def create_checkout(request: Request, user=Depends(current_user)):
 
 @router.post("/api/billing/portal", dependencies=[Depends(check_origin)])
 @limiter.limit("10/hour")
-async def create_portal(request: Request, user=Depends(current_user)):
+async def create_portal(request: Request, response: Response,
+                        user=Depends(current_user)):
     db = get_db(request)
-    base = _base_url(request)
+    base = base_url(request)
     if fake_billing():
         return {"url": f"{base}/#billing=fake_portal"}
     key, _price = _stripe_conf()

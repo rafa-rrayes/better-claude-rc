@@ -27,6 +27,8 @@ QUOTA_DENIALS = Counter(
     "bcrc_quota_denials_total", "Live quota denials", ["kind"])
 STRIPE_EVENTS = Counter(
     "bcrc_stripe_events_total", "Stripe webhook events processed", ["type"])
+EMAILS_SENT = Counter(
+    "bcrc_emails_sent_total", "Transactional emails sent", ["status"])
 
 
 def render() -> tuple[bytes, str]:

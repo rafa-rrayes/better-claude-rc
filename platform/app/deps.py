@@ -6,6 +6,7 @@ stored in PG, 90d rolling. No tokens in URLs, ever.
 
 from __future__ import annotations
 
+import os
 from urllib.parse import urlparse
 
 from fastapi import HTTPException, Request
@@ -13,6 +14,12 @@ from fastapi import HTTPException, Request
 from .db import Db
 
 SESSION_COOKIE = "__Host-bcrc_sess"
+
+
+def base_url(request: Request) -> str:
+    """Public origin for links we mint (magic links, install commands)."""
+    return (os.environ.get("PLATFORM_BASE_URL")
+            or str(request.base_url)).rstrip("/")
 
 
 def get_db(request: Request) -> Db:

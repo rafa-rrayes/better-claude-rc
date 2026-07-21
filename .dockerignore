@@ -1,0 +1,15 @@
+# Keep the build context to what platform/Dockerfile copies:
+# pyproject.toml, uv.lock, README.md, LICENSE, server/, platform/.
+.git
+.gitignore
+.venv
+.ruff_cache
+.dockerignore
+data/
+dist/
+docs/
+scripts/
+tasks/
+**/__pycache__/
+*.pyc
+.DS_Store

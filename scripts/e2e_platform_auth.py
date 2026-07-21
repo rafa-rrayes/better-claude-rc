@@ -172,7 +172,27 @@ async def run_suite(pg) -> None:
     assert r.status_code == 200, r.text
     tok = r.json()
     assert tok["token"].startswith("bcrc_enr_"), tok
-    assert "connect bcrc_enr_" in tok["command"], tok
+    assert tok["command"] == \
+        f"curl -fsSL {BASE}/i/{tok['token']} | bash", tok
+
+    # installer script: bad token -> JSON 404 (not the SPA fallback); real
+    # token -> sh script with token+relay baked in (503 = no wheel built,
+    # tolerated so a clean checkout doesn't need `uv build` to pass e2e).
+    r = await http.get("/i/not-a-token")
+    assert r.status_code == 404 and "text/html" not in \
+        r.headers.get("content-type", ""), (r.status_code, r.headers)
+    r = await http.get(f"/i/{tok['token']}")
+    assert r.status_code in (200, 503), r.text
+    if r.status_code == 200:
+        assert tok["token"] in r.text and "--relay" in r.text, r.text
+        assert r.headers["cache-control"] == "no-store"
+        wheel = r.text.split("/dist/")[1].split('"')[0]
+        rw = await http.get(f"/dist/{wheel}")
+        assert rw.status_code == 200, "advertised wheel must be served"
+        assert (await http.get("/dist/nope.whl")).status_code == 404
+    else:
+        print("S2 note — no agent wheel in dist/; /i/ served 503 "
+              "(run `uv build --package better-claude-rc --wheel`)")
 
     ident1 = Identity.load_or_create(scratch / "id1.json")
     assert (scratch / "id1.json").stat().st_mode & 0o777 == 0o600
