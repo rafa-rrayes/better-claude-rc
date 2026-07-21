@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://bcrc.rrayes.com.br"
+Homepage = "https://bcrc.rrayes.com"
 Repository = "https://github.com/rafa-rrayes/better-claude-rc"
 
 [project.scripts]

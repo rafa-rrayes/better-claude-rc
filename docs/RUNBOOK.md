@@ -1,6 +1,6 @@
 # Runbook — bcrc platform on Dokploy
 
-Operational procedures for the hosted platform at `bcrc.rrayes.com.br`
+Operational procedures for the hosted platform at `bcrc.rrayes.com`
 (Dokploy VPS, app `bcrc-platform`, Postgres service `bcrc-db`). Deployment
 setup lives in [DEPLOY.md](DEPLOY.md).
 
@@ -66,7 +66,7 @@ backup pipeline as broken and fix it *now*.
    (`-Fc` dumps include schema + data; migrations table comes along, so the
    app won't re-run old migrations.)
 3. Start `bcrc-platform`; check `/readyz` returns `{"ok":true,"db":true}`.
-4. `uv run python scripts/smoke_platform.py https://bcrc.rrayes.com.br`.
+4. `uv run python scripts/smoke_platform.py https://bcrc.rrayes.com`.
 5. Expected fallout of restoring an older dump: sessions/machines created
    after the dump are gone — users re-login (magic link) and re-enroll.
 
