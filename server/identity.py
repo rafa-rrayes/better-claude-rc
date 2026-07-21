@@ -182,7 +182,11 @@ def enroll(platform_url: str, token: str, identity: Identity, *,
     }).encode()
     req = urllib.request.Request(
         platform_url.rstrip("/") + "/api/enroll", data=body,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers={"Content-Type": "application/json",
+                 # urllib's default Python-urllib/x.y UA is on Cloudflare's
+                 # Browser Integrity Check ban list (error 1010).
+                 "User-Agent": f"better-claude-rc/{agent_version}"},
+        method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.load(resp)
