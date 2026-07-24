@@ -187,7 +187,7 @@ class RelayTransport {
     this.session = session || null;
     this.codec = session ? session.codec : NullCodecJS;
     this.up = false;          // ctrl channel open AND handshake established
-    this.online = false;      // last machine_status
+    this.online = null;       // last machine_status; null until the relay says
     this.plan = null;
     this.ws = null;
     this.ctrlCh = null;
@@ -294,7 +294,13 @@ class RelayTransport {
       case "machine_status":
         this.online = !!msg.online;
         if (this.online) this._ensureCtrl();
-        else { this.up = false; this._emitStatus({ up: false, offline: true }); }
+        else {
+          this.up = false;
+          // the relay just told us nobody is home: settle in-flight calls now
+          // rather than parking the UI on them until the 30s rpc timeout
+          this._failPending(new Error("machine offline"));
+          this._emitStatus({ up: false, offline: true });
+        }
         break;
       case "opened": {
         const req = this._shiftOpen(msg.kind);
@@ -345,6 +351,7 @@ class RelayTransport {
         if (msg.code === "machine_offline") {
           this.online = false; this.up = false;
           this._ctrlPending = false;
+          this._failPending(new Error("machine offline"));
           for (const p of this._pendingOpens) {
             if (p.sock) this._termClosed(p.sock, "machine_offline");
           }
@@ -420,6 +427,10 @@ class RelayTransport {
   }
 
   rpc(method, params) {
+    // a machine the relay has already reported offline cannot answer; reject
+    // now instead of stalling the caller for the full RPC_TIMEOUT_MS. online
+    // is null until the relay's first machine_status, and those calls queue.
+    if (this.online === false) return Promise.reject(new Error("machine offline"));
     return new Promise((resolve, reject) => {
       const id = this._nextId++;
       const timer = setTimeout(() => {
