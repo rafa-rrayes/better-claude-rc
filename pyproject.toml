@@ -55,4 +55,5 @@ bcrc-platform = { workspace = true }
 dev = [
     "bcrc-platform",
     "httpx>=0.28.1",
+    "pytest>=9.2.0",
 ]
