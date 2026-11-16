@@ -1,161 +1,142 @@
 # Better Claude RC
 
-A self-hosted, mobile-first PWA that turns your phone into a proper remote
-control for [Claude Code](https://claude.com/claude-code) sessions running on
-your Mac.
+A self-hosted, mobile-first PWA that turns your phone into a remote control for [Claude Code](https://claude.com/claude-code) sessions running on your Mac.
 
-Start, resume, and drive real Claude Code sessions from your phone — with a
-structured event stream (tool cards, diffs, thinking), tap-to-approve
-permissions, and live two-way sync with the terminal on your Mac. It's a small
-FastAPI + [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk-python)
-backend and a dependency-free vanilla-JS frontend. **No build step, no cloud,
-no account** — the server runs on your machine and your phone talks to it over
-your own network.
+<!-- TODO: add a screenshot, e.g. docs/screenshot.png -->
 
-> Built as a genuinely usable replacement for the official Claude Code remote
-> flow: new sessions from the phone, structured (not terminal-scraped) output,
-> and a UI designed for a small screen.
+Start, resume and drive real Claude Code sessions from your phone. You get a structured event stream (tool cards, diffs, thinking) and tap-to-approve permissions, instead of a scraped terminal. A small FastAPI backend runs on your Mac, built on the [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk-python). The frontend is a vanilla-JS PWA with no build step.
 
 ## Features
 
-- **Start & pick projects from your phone** — recent projects from `~/.claude`
-  plus a directory browser; "New session" spawns a real Claude Code session in
-  any working directory, with model and permission-mode choice.
-- **Resume & fork with terminal parity** — open any past session and see its
-  full history backfilled from the transcript; resume keeps the *same* Claude
-  session id (or fork into a new one) and appends to the same transcript file
-  the terminal reads.
-- **Structured event stream** — text streamed as deltas, tool-call cards (Bash
-  output, Edit diffs, TodoWrite checklists), thinking blocks, compact
-  boundaries, and cost/context meters. Not terminal scraping — real structured
-  messages from the SDK.
-- **Tap-to-approve permissions** — remote permission prompts park on the server
-  and surface on the phone as Allow / Deny (with "always allow" suggestions),
-  plan-mode approval, and AskUserQuestion option buttons.
-- **Live terminal ↔ webapp sync** — turns typed in the terminal `claude` appear
-  in the webapp in real time (transcript tailer); the phone's next message
-  silently rotates through resume so both sides share full context on one
-  session id.
-- **Multi-session tabs** — browser-style open-session switcher; jump between
-  live sessions, see per-session status, close individually or all at once.
-- **Reconnect with replay** — events are seq-numbered and persisted per session,
-  so backgrounding the app on iOS and coming back replays exactly what was
-  missed.
-- **Library screens** — browse Skills, Slash commands, Agents, and MCP servers
-  (global + per-project) read from `~/.claude/*` and `~/.claude.json` /
-  `.mcp.json`, with live MCP status from the session init message.
-- **Installable PWA** — add to the iOS home screen for a full-screen,
-  app-like experience with icons and manifest.
-
-## Quickstart
-
-Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/)).
-
-```bash
-uv sync                     # create the venv + install deps (uv fetches Python 3.14)
-uv run python -m server     # start the server
-```
-
-On start, the server prints its URLs, the auth token, a **one-tap login URL**,
-and a **QR code**. Scan the QR with your iPhone camera (or open the login URL)
-to launch the PWA and log in in one step.
-
-```bash
-uv run python -m server --port 9000   # custom port
-uv run python -m server --no-qr       # skip the QR code
-uv run python -m server --host 127.0.0.1   # bind localhost only (see Security)
-```
+- **Start sessions from the phone.** Pick a recent project (read from `~/.claude`) or browse directories, then start a Claude Code session with the model and permission mode you choose.
+- **Resume and fork.** Open any past session and see its history backfilled from the transcript. Resume keeps the same session id (or fork into a new one) and appends to the same transcript file the terminal uses.
+- **Structured event stream.** Streamed text, tool-call cards (Bash output, Edit diffs, TodoWrite checklists), thinking blocks, compact boundaries, cost and context meters.
+- **Tap-to-approve permissions.** Permission prompts surface on the phone as Allow / Deny (with "always allow" suggestions), plan-mode approval, and AskUserQuestion option buttons.
+- **Terminal and phone in sync.** Turns typed in the terminal `claude` show up in the app (the server tails the transcript). A terminal view (xterm.js) is also available.
+- **Multi-session tabs and reconnect replay.** Events are sequence-numbered and persisted per session, so backgrounding the app and returning replays what you missed.
+- **Library screens.** Browse skills, slash commands, agents and MCP servers (global and per project).
+- **Installable PWA.** Add it to the home screen for a full-screen app.
 
 ## Requirements
 
-- **macOS** (network detection and the launch banner target macOS).
-- **Python ≥ 3.14** — `uv sync` fetches it automatically; you don't need it
-  pre-installed.
-- **Claude Code CLI** installed and authenticated (`claude` on your PATH,
-  already logged in). Sessions load your real `~/.claude` config — CLAUDE.md,
-  MCP servers, hooks, and custom commands all apply, exactly as in the terminal.
+- **macOS** (the launch banner and network detection target macOS).
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/).** It fetches Python 3.14 for you (`requires-python >= 3.14`).
+- **Claude Code CLI** installed and logged in. Sessions load your real `~/.claude` config (CLAUDE.md, MCP servers, hooks, commands), as in the terminal.
+- A phone on the same network as the Mac, or both on [Tailscale](https://tailscale.com).
 
-## Remote access
+## Quickstart (local mode)
 
-- **Tailscale (recommended).** If the Tailscale CLI is installed and connected,
-  the server auto-detects your Tailscale IP and prints it as the primary URL, so
-  you can use the app securely from anywhere — no port forwarding, no exposing
-  anything to the public internet.
-- **LAN fallback.** On the same Wi-Fi, the printed LAN URL works directly.
-- **Hosted platform.** No Tailscale, no network setup — see below.
+On the Mac:
 
-## Hosted platform
+```bash
+git clone https://github.com/rafa-rrayes/better-claude-rc
+cd better-claude-rc
+uv sync
+uv run python -m server          # or: uv run better-claude-rc
+```
 
-[bcrc.rrayes.com](https://bcrc.rrayes.com) is the hosted way to reach
-your Mac from anywhere, on cellular, with nothing to configure:
+The server prints its URLs, the auth token, a one-tap login link (valid 2 minutes, single use) and a QR code. If the Tailscale CLI is connected, the Tailscale URL is listed first.
 
-1. **Sign up** with your email (magic link, no password).
-2. **Enroll your Mac** — the dashboard gives you a one-line command:
-   ```bash
-   curl -fsSL https://<platform>/i/bcrc_enr_… | bash
-   ```
-   It installs [uv](https://docs.astral.sh/uv/) if needed, installs the agent
-   from the platform's self-hosted wheel (no PyPI), and connects.
-3. **Scan the QR** the agent prints with your phone. That pairing is the
-   encryption root: keys live only on your phone and your Mac.
-4. **Drive sessions** from the PWA — live sessions, terminals, permission
-   prompts, history — exactly like local mode.
+On the phone:
 
-The relay is **end-to-end encrypted and blind by design**: after the QR
-pairing, every frame between phone and Mac is sealed with keys the platform
-never sees (libsodium secretstream). The server routes opaque ciphertext and
-can enforce quotas — it cannot read prompts, code, or output. Local mode
-stays fully supported and unchanged; the hosted platform is optional.
+1. Scan the QR with the camera (or open the login link). You are logged in and the app opens.
+2. Add it to the home screen (iOS: Share, then Add to Home Screen; Android: browser menu, then Install app).
+3. Next time, open the app from the home screen. The login cookie lasts 180 days.
 
-> iOS papercut: an installed (home-screen) app keeps a cookie jar separate
-> from Safari, and sign-in links from Mail open in Safari. Easiest order:
-> sign in inside Safari first, **then** Share → Add to Home Screen — the
-> installed app inherits the signed-in session at install time.
+Options:
+
+```bash
+uv run python -m server --port 9000        # default port is 8787
+uv run python -m server --no-qr            # no QR code
+uv run python -m server --host 127.0.0.1   # this Mac only
+```
+
+## Configuration
+
+State lives in `data/` inside the checkout (or `~/.better-claude-rc` when installed as a wheel). Set `BCRC_DATA_DIR` to override.
+
+`data/config.json` is created on first run:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `token` | random | The auth token. Delete the file to rotate it. |
+| `host` | `0.0.0.0` | Bind address (`--host` overrides). |
+| `port` | `8787` | Port (`--port` overrides). |
+| `browse_root` | `~` | The directory browser and file reads are confined to this tree. |
+| `relay_url` | unset | Only used by connect mode (see below). |
+
+## Architecture
+
+```
+phone (PWA)  <--HTTP/WebSocket-->  FastAPI server on your Mac  -->  claude-agent-sdk -> Claude Code
+                                     |-- tails ~/.claude transcripts (terminal sync)
+                                     `-- pty manager (terminal view)
+```
+
+- `server/` is the backend: `main.py` (HTTP + `/ws`), `rpc.py` (method table), `sessions.py` (SDK sessions, permissions, replay), `watch.py` (transcript tailer), `terminal.py`, `library.py`, `projects.py`.
+- `server/web/` is the PWA (`app.js`, `transport.js`, `crypto.js`, `style.css`), served by the same server.
+- `platform/` is an optional hosted relay, covered next.
+
+### Connect mode and the hosted platform (optional)
+
+Local mode needs your phone to reach the Mac directly. The alternative is `better-claude-rc connect`: the Mac dials out to a relay, so no inbound port is needed. This repo contains the relay and account service (`platform/`: FastAPI, Postgres, email magic links, Stripe billing). `docs/DEPLOY.md` and `docs/RUNBOOK.md` describe running it yourself. The author also runs one at [bcrc.rrayes.com](https://bcrc.rrayes.com). Enrolling a machine there uses a one-line installer from the dashboard; the free plan allows 1 live Claude session and the pro plan 10. Local mode is unaffected by any of this and needs no account.
 
 ## Security model
 
-This server exposes control of Claude Code sessions on your Mac. Treat it
-accordingly:
+This server controls Claude Code on your Mac, which can run commands and edit files. Treat access to it like shell access.
 
-- **Token auth.** A random token is generated on first run and stored in
-  `data/config.json`. Every request (and the WebSocket) must present it. Login
-  sets an **HttpOnly cookie**; the token is embedded in the QR / one-tap login
-  URL so onboarding is a single scan.
-- **The server binds `0.0.0.0` by default** — it is visible to everyone on your
-  local network. That's intended for LAN/Tailscale use. **Do not port-forward it
-  to the public internet.** For off-network access, use Tailscale (the token is
-  your only credential; keep the login URL private). To restrict to the local
-  machine, run with `--host 127.0.0.1`.
-- **Nothing sensitive is committed.** The token and all session transcripts live
-  under `data/`, which is gitignored and regenerated on first run.
+### Local mode (`python -m server`)
 
-## Handoff semantics
+- **Authentication.** A random token (`secrets.token_urlsafe(24)`) is generated on first run and stored in plain text in `data/config.json`. Every API request and the WebSocket must present it, as an `Authorization: Bearer` header or the `bcrc_token` cookie. Comparison is constant-time.
+- **Pairing the phone.** The QR and login link carry a one-time login code (2 minutes, single use, in the URL fragment so it is not sent to the server or put in query strings), not the token. Redeeming it sets an HttpOnly, SameSite=Lax cookie holding the token. You can also log in by pasting the token.
+- **WebSocket.** Cookie-only auth (no tokens in query strings) plus a same-origin check on browser upgrades.
+- **Filesystem confinement.** The directory browser, file reads and new-session working directories must be inside `browse_root` (home by default). Claude itself, once running, can do whatever your permission mode allows.
+- **Network exposure.** The server binds `0.0.0.0` by default and speaks plain HTTP. The token and cookie travel unencrypted, so anyone on the network path can read them. The cookie has no `Secure` flag because the app is served over HTTP. libsodium is not used in this mode.
+- **Recommended setup.** Use Tailscale (traffic is WireGuard-encrypted and nothing is exposed publicly) or a trusted home LAN. Do not port-forward it or put it on the public internet. If you only use Tailscale, you can pass `--host` with your Tailscale IP, or `127.0.0.1` if you front it yourself. Keep the printed login link private.
 
-The terminal `claude` and the webapp mirror **one** transcript file (the single
-source of truth both append to):
+### Connect mode (`better-claude-rc connect`)
 
-- The webapp can mirror a live terminal session and vice versa; opening a
-  session on either side backfills its history and stays in sync.
-- **One driver at a time.** Two processes actively driving the *same* session id
-  simultaneously would fork the parent chain — so hand off, don't co-drive. The
-  webapp mirrors a live terminal, but both typing at once is unsupported by
-  design. An already-open terminal TUI can't live-refresh mid-session (a CLI
-  limitation); it picks up the phone's turns on the next `--resume` / `--continue`.
+- **Outbound only.** The agent dials out to the relay. Its local server binds `127.0.0.1` unless you pass `--lan`.
+- **Identity.** The Mac generates an Ed25519 key pair; the seed stays in `data/identity.json` (mode 0600, data dir 0700) and the platform stores only the public key. The phone has its own Ed25519 key in the browser's IndexedDB.
+- **Pairing.** A 32-byte single-use secret (valid 10 minutes, held only in the agent's memory) is shown as a QR and code in the terminal. The relay never sees it. It authenticates the phone's first pairing message and lets the phone pin the Mac's public key. Paired phone keys are stored in `data/devices.json` and can be revoked.
+- **What libsodium does.** Both ends use libsodium (PyNaCl on the Mac, the vendored `libsodium.js` in the phone's browser): `crypto_sign` (Ed25519) signatures on the handshake, `crypto_kx` for a fresh key exchange per connection, `crypto_secretstream_xchacha20poly1305` to encrypt and authenticate every frame, and keyed BLAKE2b for the pairing MAC and key derivation.
+- **What the relay sees.** The relay routes opaque ciphertext. The agent refuses plaintext, tampered or replayed frames and unpaired devices, and closes the connection (`scripts/e2e_crypto.py` tests these cases). The relay still sees account email, machine names, connection timing and traffic volume. Session ids travel inside the encrypted stream.
+- **Caveat.** The relay serves the web app code to your phone, so you are trusting the relay operator not to ship malicious JavaScript. Self-host it if that matters to you.
+
+## Limitations
+
+- macOS only; Python 3.14+.
+- One driver per session at a time. The app mirrors a live terminal session, but typing in both at once is unsupported and can fork the transcript chain. An already-open terminal TUI cannot live-refresh; it sees the phone's turns on its next `--resume` or `--continue`.
+- Local mode is plain HTTP, so use Tailscale or a trusted LAN.
+- No tests drive a real Claude turn in CI; the `scripts/e2e_*.py` files do, and need a logged-in `claude`.
+- Beta: expect rough edges.
+
+## Related projects
+
+Same author, different scope:
+
+- **better-claude-rc** (this repo): the lightweight option. One Mac, phone first, runs on your machine with no account.
+- **[valet](https://github.com/rafa-rrayes/valet)**: a control plane for always-on agents across containers and machines, with web and iOS/macOS apps.
+- **[cockpit](https://github.com/rafa-rrayes/cockpit)**: a VS Code extension giving a live overview of all your Claude Code sessions.
 
 ## Development
 
-The backend is a normal FastAPI app under `server/`; the frontend is a single
-vanilla-JS SPA under `server/web/` (no build step — edit and reload).
-
 ```bash
-uv run python scripts/smoke_api.py    # REST smoke suite
-uv run python scripts/e2e_live.py     # live end-to-end (text / Bash / compact / resume / sync / hooks)
+uv sync
+uv run pytest                          # auth/unit tests, no Claude needed
+uv run python scripts/smoke_api.py     # REST smoke test
+uv run python scripts/e2e_crypto.py    # E2E crypto negative tests (in-process relay)
+uv run python scripts/e2e_live.py      # live end-to-end; needs a logged-in `claude`
 ```
 
-The `scripts/e2e_*.py` files each exercise one slice end-to-end against a live
-server (resume parity, permission approve/deny, terminal↔webapp sync, Stop-hook
-status feedback).
+The frontend has no build step: edit `server/web/` and reload.
 
 ## License
 
-[MIT](LICENSE) © 2026 Rafa Rayes
+[MIT](LICENSE) (c) 2026 Rafa Rayes.
+
+The PWA vendors third-party files under `server/web/vendor/`, each under its own license (see the `VENDOR.md` in each folder):
+
+- **xterm.js** and its fit addon: MIT (`xterm.css` keeps its original copyright header).
+- **libsodium.js** 0.7.15: ISC.
+- **jsQR** 1.4.0: Apache-2.0.
