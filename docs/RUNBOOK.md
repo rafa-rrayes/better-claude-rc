@@ -1,6 +1,6 @@
 # Runbook — bcrc platform on Dokploy
 
-Operational procedures for the hosted platform at `bcrc.rrayes.com`
+Operational procedures for a self-hosted platform at `bcrc.example.com`
 (Dokploy VPS, app `bcrc-platform`, Postgres service `bcrc-db`). Deployment
 setup lives in [DEPLOY.md](DEPLOY.md).
 
@@ -15,7 +15,7 @@ Set it up once in the Dokploy UI:
 
 1. Postgres service → **Schedules** → Create.
 2. Schedule type: run inside the service container; shell `sh`.
-3. Cron: `0 6 * * *` (06:00 UTC = 03:00 São Paulo, quiet hours).
+3. Cron: `0 6 * * *` (06:00 UTC, a quiet hour).
 4. Command: paste the contents of `scripts/pg_backup.sh` (or mount it and run
    `sh /path/pg_backup.sh`).
 5. Optional env: `KEEP_DAYS=14`, `BACKUP_DIR=/var/lib/postgresql/data/backups`.
@@ -66,7 +66,7 @@ backup pipeline as broken and fix it *now*.
    (`-Fc` dumps include schema + data; migrations table comes along, so the
    app won't re-run old migrations.)
 3. Start `bcrc-platform`; check `/readyz` returns `{"ok":true,"db":true}`.
-4. `uv run python scripts/smoke_platform.py https://bcrc.rrayes.com`.
+4. `uv run python scripts/smoke_platform.py https://bcrc.example.com`.
 5. Expected fallout of restoring an older dump: sessions/machines created
    after the dump are gone — users re-login (magic link) and re-enroll.
 
